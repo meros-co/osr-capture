@@ -67,7 +67,7 @@ declare module "osr-capture" {
      * `Buffer` when no downscale was requested, or `{ main, scaled }` when `dstWidth`/`dstHeight` were given to
      * {@link readbackConsume} (`main` = the `format` buffer, `scaled` = `dstWidth * dstHeight * 4` BGRA).
      */
-    export function readbackFinish(poolKey: string, width: number, height: number, format?: ReadbackFormat, dstWidth?: number, dstHeight?: number): Promise<Buffer | { main: Buffer; scaled: Buffer }>
+    export function readbackFinish(poolKey: string, width: number, height: number, format?: ReadbackFormat, dstWidth?: number, dstHeight?: number, dst?: Buffer): Promise<Buffer | { main: Buffer; scaled: Buffer }>
 
     /**
      * SINGLE-DISPATCH readback (Windows / Linux-GPU) — the collapse of {@link readbackConsume} + {@link readbackFinish}

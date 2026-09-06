@@ -5,7 +5,9 @@
 //     All platforms convert on the GPU: Windows a D3D11 compute shader, macOS a Metal compute kernel on the
 //     IOSurface wrapped zero-copy as an MTLTexture, Linux EGL/GLES3 when that path initialized (see
 //     LINUX_GPU_READBACK.md). Each falls back to the CPU converter only when its GPU path is unavailable.
-//   readbackConsume(source, w, h, format, poolKey, dstW?, dstH?) / readbackFinish(poolKey, w, h, format, dstW?, dstH?)
+//   readbackConsume(source, w, h, format, poolKey, dstW?, dstH?) / readbackFinish(poolKey, w, h, format, dstW?, dstH?, dst?)
+//     dst: an optional caller-owned Buffer (>= frame bytes, untouched until the promise settles) that receives
+//     the frame directly, so the caller can hand it to its consumers without copying it again.
 //     Two-phase readback (Windows always; macOS when a Metal device exists; Linux when the GPU path is
 //     active — absent otherwise): release the shared texture right after the GPU consume, then copy out.
 //     dstW/dstH also GPU-downscale a small BGRA in the same pass -> readbackFinish resolves { main, scaled }.

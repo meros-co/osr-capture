@@ -438,7 +438,19 @@ Napi::Value ReadbackFinishJs(const Napi::CallbackInfo& info) {
     uint32_t dstH = (info.Length() > 5 && info[5].IsNumber()) ? info[5].As<Napi::Number>().Uint32Value() : 0;
     auto deferred = Napi::Promise::Deferred::New(env);
     size_t outSize = OutputSize(w, h, format);
-    Napi::Buffer<uint8_t> result = AcquireOutputBuffer(env, key, outSize);
+    // finish(key, w, h, format, dstW, dstH, dst?): an optional caller-owned Buffer receives the frame
+    // directly (the caller then hands that same buffer to its consumers without another copy); it must be
+    // at least outSize bytes and untouched until the promise settles. Otherwise a pooled buffer is used.
+    Napi::Buffer<uint8_t> result;
+    if (info.Length() > 6 && info[6].IsBuffer()) {
+        result = info[6].As<Napi::Buffer<uint8_t>>();
+        if (result.ByteLength() < outSize) {
+            deferred.Reject(Napi::Error::New(env, "readbackFinish: destination buffer is smaller than the frame").Value());
+            return deferred.Promise();
+        }
+    } else {
+        result = AcquireOutputBuffer(env, key, outSize);
+    }
 
     bool hasScaled = dstW > 0 && dstH > 0;
     size_t scaledSize = hasScaled ? (size_t)dstW * dstH * 4 : 0;
