@@ -194,21 +194,40 @@ Napi::Value Readback(const Napi::CallbackInfo& info) {
 // cached memcpy, but the early release still matters because it hands the compositor's frame pool its
 // surface back a full copy sooner.
 // Windows and macOS take a shared-texture handle; Linux takes dmabuf planes — hence the ctor/Execute split.
+// targets: JS array of { width, height, format } (see osrcap::TargetSpec); absent/empty -> none
+std::vector<osrcap::TargetSpec> ParseTargets(const Napi::CallbackInfo& info, size_t index) {
+    std::vector<osrcap::TargetSpec> out;
+    if (info.Length() <= index || !info[index].IsArray()) return out;
+    Napi::Array arr = info[index].As<Napi::Array>();
+    for (uint32_t i = 0; i < arr.Length(); ++i) {
+        Napi::Value v = arr.Get(i);
+        if (!v.IsObject()) continue;
+        Napi::Object o = v.As<Napi::Object>();
+        osrcap::TargetSpec t;
+        t.w = o.Has("width") ? o.Get("width").As<Napi::Number>().Uint32Value() : 0;
+        t.h = o.Has("height") ? o.Get("height").As<Napi::Number>().Uint32Value() : 0;
+        t.format = o.Has("format") ? o.Get("format").As<Napi::Number>().Int32Value() : 0;
+        if (t.w && t.h) out.push_back(t);
+    }
+    return out;
+}
+
 class ConsumeWorker : public Napi::AsyncWorker {
 public:
 #if defined(_WIN32) || defined(__APPLE__)
-    ConsumeWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, Napi::Promise::Deferred deferred)
-        : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), deferred_(deferred) {}
+    ConsumeWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred)
+        : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred) {}
 #elif defined(__linux__)
-    ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, Napi::Promise::Deferred deferred)
-        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), deferred_(deferred) {}
+    ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred)
+        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred) {}
 #endif
     void Execute() override {
         std::string err;
 #if defined(_WIN32) || defined(__APPLE__)
-        bool ok = osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, err);
+        bool ok = osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #elif defined(__linux__)
-        bool ok = osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, err);
+        bool ok = targets_.empty() ? osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, err) : false;
+        if (!targets_.empty()) err = "per-consumer targets are not supported by the Linux backend";
 #endif
         if (!ok) SetError(err.empty() ? "consume failed" : err);
     }
@@ -229,6 +248,7 @@ private:
     int format_;
     std::string key_;
     uint32_t dstW_, dstH_;
+    std::vector<osrcap::TargetSpec> targets_;
     Napi::Promise::Deferred deferred_;
 };
 
@@ -241,16 +261,36 @@ public:
           scaledDst_(scaledDst), scaledSize_(scaledSize), hasScaled_(hasScaled), deferred_(deferred) {
         if (hasScaled) scaledRef_ = Napi::Persistent(scaledResult);
     }
+    // per-consumer target buffers (one per TargetSpec given to consume); the promise then resolves an object
+    // with a `targets` array even when there is no `scaled`
+    void SetTargets(std::vector<Napi::Buffer<uint8_t>> bufs) {
+        hasTargets_ = true;
+        for (auto& b : bufs) {
+            targetDsts_.push_back({ b.Data(), b.ByteLength() });
+            targetRefs_.push_back(Napi::Persistent(b));
+        }
+    }
     void Execute() override {
         std::string err;
-        if (!osrcap::ReadbackFinish(key_, dst_, dstSize_, scaledDst_, scaledSize_, err)) SetError(err.empty() ? "finish failed" : err);
+#if defined(__linux__)
+        bool ok = targetDsts_.empty() ? osrcap::ReadbackFinish(key_, dst_, dstSize_, scaledDst_, scaledSize_, err) : false;
+        if (!targetDsts_.empty()) err = "per-consumer targets are not supported by the Linux backend";
+#else
+        bool ok = osrcap::ReadbackFinish(key_, dst_, dstSize_, scaledDst_, scaledSize_, targetDsts_, err);
+#endif
+        if (!ok) SetError(err.empty() ? "finish failed" : err);
     }
     void OnOK() override {
         Napi::HandleScope s(Env());
-        if (hasScaled_) {
+        if (hasScaled_ || hasTargets_) {
             Napi::Object o = Napi::Object::New(Env());
             o.Set("main", resultRef_.Value());
-            o.Set("scaled", scaledRef_.Value());
+            if (hasScaled_) o.Set("scaled", scaledRef_.Value());
+            if (hasTargets_) {
+                Napi::Array arr = Napi::Array::New(Env(), targetRefs_.size());
+                for (size_t i = 0; i < targetRefs_.size(); ++i) arr.Set((uint32_t)i, targetRefs_[i].Value());
+                o.Set("targets", arr);
+            }
             deferred_.Resolve(o);
         } else {
             deferred_.Resolve(resultRef_.Value());
@@ -267,6 +307,9 @@ private:
     size_t scaledSize_;
     bool hasScaled_;
     Napi::Reference<Napi::Buffer<uint8_t>> scaledRef_;
+    bool hasTargets_ = false;
+    std::vector<osrcap::TargetDst> targetDsts_;
+    std::vector<Napi::Reference<Napi::Buffer<uint8_t>>> targetRefs_;
     Napi::Promise::Deferred deferred_;
 };
 
@@ -417,12 +460,12 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
     uintptr_t handle = 0;
     Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
     if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
-    (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, deferred))->Queue();
+    (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred))->Queue();
 #elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes;
     uint64_t modifier = 0;
     ParseLinuxSource(info[0], planes, modifier);
-    (new ConsumeWorker(env, std::move(planes), modifier, w, h, format, std::move(key), dstW, dstH, deferred))->Queue();
+    (new ConsumeWorker(env, std::move(planes), modifier, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred))->Queue();
 #endif
     return deferred.Promise();
 }
@@ -456,7 +499,27 @@ Napi::Value ReadbackFinishJs(const Napi::CallbackInfo& info) {
     size_t scaledSize = hasScaled ? (size_t)dstW * dstH * 4 : 0;
     // separate reused pool for the scaled buffer so it never aliases the main (UYVY) pool for this output
     Napi::Buffer<uint8_t> scaledResult = hasScaled ? AcquireOutputBuffer(env, key + "#scaled", scaledSize) : Napi::Buffer<uint8_t>::New(env, 0);
-    (new FinishWorker(env, std::move(key), result.Data(), outSize, result, hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, deferred))->Queue();
+    // finish(..., dst?, targets?, targetDsts?): `targets` repeats the specs given to consume (so each output's
+    // byte size is known); `targetDsts` optionally supplies caller-owned buffers, else pooled ones are used
+    std::vector<osrcap::TargetSpec> targets = ParseTargets(info, 7);
+    std::vector<Napi::Buffer<uint8_t>> targetBufs;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        size_t bytes = osrcap::TargetBytes(targets[i]);
+        Napi::Buffer<uint8_t> tb;
+        if (info.Length() > 8 && info[8].IsArray() && info[8].As<Napi::Array>().Get((uint32_t)i).IsBuffer()) {
+            tb = info[8].As<Napi::Array>().Get((uint32_t)i).As<Napi::Buffer<uint8_t>>();
+            if (tb.ByteLength() < bytes) {
+                deferred.Reject(Napi::Error::New(env, "readbackFinish: a target destination buffer is smaller than its frame").Value());
+                return deferred.Promise();
+            }
+        } else {
+            tb = AcquireOutputBuffer(env, key + "#t" + std::to_string(i), bytes);
+        }
+        targetBufs.push_back(tb);
+    }
+    auto* worker = new FinishWorker(env, std::move(key), result.Data(), outSize, result, hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, deferred);
+    if (!targets.empty()) worker->SetTargets(std::move(targetBufs));
+    worker->Queue();
     return deferred.Promise();
 }
 
@@ -550,6 +613,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #endif
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
+    exports.Set("targetsSupported", Napi::Boolean::New(env, osrcap::TargetsSupported()));
 #endif
 #if defined(_WIN32)
     exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));

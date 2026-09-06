@@ -8,6 +8,9 @@
 //   readbackConsume(source, w, h, format, poolKey, dstW?, dstH?) / readbackFinish(poolKey, w, h, format, dstW?, dstH?, dst?)
 //     dst: an optional caller-owned Buffer (>= frame bytes, untouched until the promise settles) that receives
 //     the frame directly, so the caller can hand it to its consumers without copying it again.
+//     targets: [{ width, height, format }] per-consumer outputs produced in the SAME pass (box-downscale +
+//     convert) when `targetsSupported` (Windows D3D11); finish takes the same list plus optional caller
+//     buffers (targetDsts) and resolves { main, scaled?, targets: Buffer[] }.
 //     Two-phase readback (Windows always; macOS when a Metal device exists; Linux when the GPU path is
 //     active — absent otherwise): release the shared texture right after the GPU consume, then copy out.
 //     dstW/dstH also GPU-downscale a small BGRA in the same pass -> readbackFinish resolves { main, scaled }.

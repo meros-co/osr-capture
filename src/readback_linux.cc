@@ -189,3 +189,8 @@ bool ReadbackOnce(const std::vector<DmabufPlane>& planes, uint64_t modifier, uin
 }
 
 }  // namespace osrcap
+
+namespace osrcap {
+// Per-consumer targets are not produced by the GLES path yet: the caller downscales/converts on the CPU.
+bool TargetsSupported() { return false; }
+}  // namespace osrcap

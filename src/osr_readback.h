@@ -10,6 +10,26 @@
 
 namespace osrcap {
 
+// A per-consumer output produced from the same shared texture in the same GPU pass as the main readback:
+// the source box-downscaled to w x h and packed as `format` (0 BGRA, 1 UYVY, 2 UYVA). One render can
+// feed outputs of several resolutions with one readback (render once at the largest, downscale the rest).
+struct TargetSpec {
+    uint32_t w = 0;
+    uint32_t h = 0;
+    int format = 0;
+};
+// Destination for one target's bytes in ReadbackFinish (caller-owned, at least TargetBytes(spec) long).
+struct TargetDst {
+    uint8_t* data = nullptr;
+    size_t size = 0;
+};
+inline size_t TargetBytes(const TargetSpec& t) {
+    size_t px = static_cast<size_t>(t.w) * t.h;
+    return t.format == 1 ? px * 2 : (t.format == 2 ? px * 3 : px * 4);
+}
+// Whether this platform's GPU backend produces TargetSpec outputs (Windows D3D11 today).
+bool TargetsSupported();
+
 // format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (colour + alpha), 3 = RGBA (swizzle). All three
 // platforms convert on the GPU — Windows HLSL compute, macOS Metal compute, Linux GLES3 shader — and each
 // falls back to the CPU converter only when its GPU path is unavailable for the device or the frame.
@@ -37,6 +57,9 @@ bool MacGpuReadbackInit();
 // ReadbackFinish then fills `scaledDst` (scaledSize bytes) with that tightly-packed BGRA. Pass 0 / nullptr to skip.
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err);
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err);
+// Same, with per-consumer targets (see TargetSpec). `targetDsts` must have one entry per target given to consume.
+bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err);
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err);
 void ReadbackReleaseKey(const std::string& key);  // drop any pending consume for `key` (cleanup)
 
 // SINGLE-DISPATCH readback (plan §11 fix #1 — collapse the two-phase Consume/Finish into ONE N-API async op).

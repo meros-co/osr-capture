@@ -423,6 +423,79 @@ struct DsParams {
     uint32_t dstH;
 };
 
+// Per-consumer target: box-downscale the shared BGRA to dstW x dstH and pack straight into the consumer's
+// format, so a smaller output of the same render costs one small extra pass instead of its own render.
+// Same integer block bounds as DSMain (float accumulate). One thread per PAIR of output pixels: UYVY/UYVA
+// need the pair for chroma; BGRA writes both. Alpha plane (UYVA) follows the UYVY plane at gUyvySize.
+const char* kScaleConvertHLSL = R"HLSL(
+Texture2D<float4> gSrc : register(t0);
+RWByteAddressBuffer gDst : register(u0);
+cbuffer ScParams : register(b0) {
+    uint gSrcW; uint gSrcH; uint gDstW; uint gDstH;
+    uint gFormat; uint gUyvySize; uint gPad0; uint gPad1;
+};
+int toByte(float v) { return (int)(v * 255.0 + 0.5); }
+float4 boxAvg(uint dx, uint dy) {
+    uint sx0 = dx * gSrcW / gDstW;
+    uint sx1 = (dx + 1) * gSrcW / gDstW; if (sx1 <= sx0) sx1 = sx0 + 1;
+    uint sy0 = dy * gSrcH / gDstH;
+    uint sy1 = (dy + 1) * gSrcH / gDstH; if (sy1 <= sy0) sy1 = sy0 + 1;
+    float4 acc = float4(0, 0, 0, 0);
+    uint cnt = 0;
+    for (uint y = sy0; y < sy1; ++y) {
+        for (uint x = sx0; x < sx1; ++x) { acc += gSrc.Load(int3(x, y, 0)); ++cnt; }
+    }
+    return acc / cnt;
+}
+[numthreads(8, 8, 1)]
+void SCMain(uint3 tid : SV_DispatchThreadID) {
+    uint px = tid.x * 2;
+    uint y = tid.y;
+    if (px >= gDstW || y >= gDstH) return;
+    float4 c0 = boxAvg(px, y);
+    float4 c1 = (px + 1 < gDstW) ? boxAvg(px + 1, y) : c0;
+    if (gFormat == 0) {
+        uint w0 = (uint)toByte(c0.b) | ((uint)toByte(c0.g) << 8) | ((uint)toByte(c0.r) << 16) | ((uint)toByte(c0.a) << 24);
+        gDst.Store((y * gDstW + px) * 4, w0);
+        if (px + 1 < gDstW) {
+            uint w1 = (uint)toByte(c1.b) | ((uint)toByte(c1.g) << 8) | ((uint)toByte(c1.r) << 16) | ((uint)toByte(c1.a) << 24);
+            gDst.Store((y * gDstW + px + 1) * 4, w1);
+        }
+        return;
+    }
+    int r0=toByte(c0.r),g0=toByte(c0.g),b0=toByte(c0.b);
+    int r1=toByte(c1.r),g1=toByte(c1.g),b1=toByte(c1.b);
+    int y0=(77*r0+150*g0+29*b0)>>8;
+    int y1=(77*r1+150*g1+29*b1)>>8;
+    int u=clamp(((-43*r0-85*g0+128*b0)>>8)+128,0,255);
+    int v=clamp(((128*r0-107*g0-21*b0)>>8)+128,0,255);
+    uint word = (uint)u | ((uint)y0<<8) | ((uint)v<<16) | ((uint)y1<<24);
+    gDst.Store(y * gDstW * 2 + px * 2, word);
+    if (gFormat == 2) {
+        // alpha plane, one byte per pixel; this thread owns bytes px and px+1 -> write as a 16-bit store
+        // via a 32-bit read-modify-write is not available on raw buffers, so the pair is packed per 4 pixels
+        // by the thread whose px % 4 == 0 using its neighbour pair's alpha.
+        if ((px & 3) == 0) {
+            float4 c2 = (px + 2 < gDstW) ? boxAvg(px + 2, y) : c1;
+            float4 c3 = (px + 3 < gDstW) ? boxAvg(px + 3, y) : c2;
+            uint aword = (uint)toByte(c0.a) | ((uint)toByte(c1.a)<<8) | ((uint)toByte(c2.a)<<16) | ((uint)toByte(c3.a)<<24);
+            gDst.Store(gUyvySize + y * gDstW + px, aword);
+        }
+    }
+}
+)HLSL";
+
+struct ScParams {
+    uint32_t srcW;
+    uint32_t srcH;
+    uint32_t dstW;
+    uint32_t dstH;
+    uint32_t format;
+    uint32_t uyvySize;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
 // BGRA -> RGBA channel swap on the GPU (for WebRTC's ImageData, which is RGBA). Same size as the source, so the
 // only cost over a plain BGRA readback is the swizzle, which the GPU does for free while the readback runs.
 const char* kSwizzleHLSL = R"HLSL(
@@ -477,6 +550,18 @@ struct ReadbackContext {
     ComPtr<ID3D11UnorderedAccessView> dsOutUav;
     ComPtr<ID3D11Buffer> dsOutStaging;
     size_t dsOutBufSize = 0;
+
+    // per-consumer targets (osrcap::TargetSpec): downscale+convert in one pass, one slot per target
+    ComPtr<ID3D11ComputeShader> scShader;
+    ComPtr<ID3D11Buffer> scParamsCb;
+    struct TargetSlot {
+        ComPtr<ID3D11Buffer> buf;
+        ComPtr<ID3D11UnorderedAccessView> uav;
+        ComPtr<ID3D11Buffer> staging;
+        size_t bytes = 0;
+        size_t pending = 0;  // bytes waiting in `staging` for this frame (0 = none)
+    };
+    std::vector<TargetSlot> targetSlots;
 
     bool inUse = false;
 
@@ -846,6 +931,76 @@ struct ReadbackContext {
         return true;
     }
 
+    bool EnsureScShader() {
+        if (scShader) return true;
+        ComPtr<ID3DBlob> blob, errBlob;
+        HRESULT hr = D3DCompile(kScaleConvertHLSL, strlen(kScaleConvertHLSL), "scaleconvert.hlsl", nullptr, nullptr, "SCMain", "cs_5_0", 0, 0, &blob, &errBlob);
+        if (FAILED(hr)) return false;
+        if (FAILED(device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &scShader))) return false;
+        D3D11_BUFFER_DESC cb = {};
+        cb.ByteWidth = sizeof(ScParams);
+        cb.Usage = D3D11_USAGE_DEFAULT;
+        cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        return SUCCEEDED(device->CreateBuffer(&cb, nullptr, &scParamsCb));
+    }
+
+    bool EnsureTargetSlot(TargetSlot& slot, size_t bytes) {
+        if (slot.buf && slot.bytes == bytes) return true;
+        slot.buf.Reset(); slot.uav.Reset(); slot.staging.Reset();
+        slot.bytes = 0;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = (UINT)bytes;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        if (FAILED(device->CreateBuffer(&bd, nullptr, &slot.buf))) return false;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements = (UINT)(bytes / 4);
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(device->CreateUnorderedAccessView(slot.buf.Get(), &ud, &slot.uav))) return false;
+        D3D11_BUFFER_DESC sd = {};
+        sd.ByteWidth = (UINT)bytes;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device->CreateBuffer(&sd, nullptr, &slot.staging))) return false;
+        slot.bytes = bytes;
+        return true;
+    }
+
+    // Queue one target's downscale+convert into its slot's staging buffer (the caller's GPU wait covers it).
+    bool ScaleConvertToStaging(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, const osrcap::TargetSpec& t, TargetSlot& slot, std::string& err) {
+        if (!EnsureScShader()) { err = "scale-convert shader init failed"; return false; }
+        // 4-byte raw stores: round the buffer up so the last alpha word of a UYVA target fits
+        size_t bytes = (osrcap::TargetBytes(t) + 3) & ~(size_t)3;
+        if (!EnsureTargetSlot(slot, bytes)) { err = "target buffer creation failed"; return false; }
+        ComPtr<ID3D11ShaderResourceView> srv;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "target SRV creation failed"; return false; }
+        ScParams p{ srcW, srcH, t.w, t.h, (uint32_t)t.format, (uint32_t)((size_t)t.w * 2 * t.h), 0, 0 };
+        context->UpdateSubresource(scParamsCb.Get(), 0, nullptr, &p, 0, 0);
+        ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+        ID3D11UnorderedAccessView* uavs[] = { slot.uav.Get() };
+        ID3D11Buffer* cbs[] = { scParamsCb.Get() };
+        context->CSSetShader(scShader.Get(), nullptr, 0);
+        context->CSSetShaderResources(0, 1, srvs);
+        context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        context->CSSetConstantBuffers(0, 1, cbs);
+        context->Dispatch(((t.w + 1) / 2 + 7) / 8, (t.h + 7) / 8, 1);
+        ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+        ID3D11UnorderedAccessView* nullUav[] = { nullptr };
+        context->CSSetShaderResources(0, 1, nullSrv);
+        context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+        context->CopyResource(slot.staging.Get(), slot.buf.Get());
+        slot.pending = osrcap::TargetBytes(t);
+        return true;
+    }
+
     // GPU box-downscale `shared` (BGRA) -> dsOutStaging (small tightly-packed BGRA). Queues GPU work only;
     // the caller's WaitGpu() covers completion, and ReadPending() maps dsOutStaging out.
     bool DownscaleToStaging(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::string& err) {
@@ -1054,6 +1209,10 @@ struct ReadbackContext {
     // dstW/dstH > 0 additionally GPU-downscales the shared BGRA to a small buffer (for server/stage) in the
     // SAME GPU pass, so a mixed output reads back UYVY (NDI) + a few-MB scaled BGRA instead of the full frame.
     bool ConsumeShared(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH, std::string& err) {
+        return ConsumeShared(handle, width, height, format, dstW, dstH, std::vector<osrcap::TargetSpec>(), err);
+    }
+
+    bool ConsumeShared(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH, const std::vector<osrcap::TargetSpec>& targets, std::string& err) {
         ComPtr<ID3D11Texture2D> shared;
         if (!OpenSharedTex(handle, shared, err)) return false;
 
@@ -1091,6 +1250,12 @@ struct ReadbackContext {
         if (ok && dstW > 0 && dstH > 0) {
             if (DownscaleToStaging(shared.Get(), width, height, dstW, dstH, err)) pendingScaledTotal = (size_t)dstW * dstH * 4;
             else ok = false;
+        }
+        // per-consumer targets, queued in the same pass before the single GPU wait below
+        for (auto& slot : targetSlots) slot.pending = 0;
+        if (ok && !targets.empty()) {
+            if (targetSlots.size() < targets.size()) targetSlots.resize(targets.size());
+            for (size_t i = 0; i < targets.size() && ok; ++i) ok = ScaleConvertToStaging(shared.Get(), width, height, targets[i], targetSlots[i], err);
         }
         // Ensure the GPU is done reading `shared` before the caller releases it.
         if (on12Active) {
@@ -1141,6 +1306,10 @@ struct ReadbackContext {
     // Phase 2: copy the pending result into `dst` (the slow WC/PCIe read for the convert path). When a GPU
     // downscale was requested, also copy the small scaled BGRA into `scaledDst` (cheap — only a few MB).
     bool ReadPending(uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+        return ReadPending(dst, dstSize, scaledDst, scaledSize, std::vector<osrcap::TargetDst>(), err);
+    }
+
+    bool ReadPending(uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<osrcap::TargetDst>& targetDsts, std::string& err) {
         size_t n = pendingTotal < dstSize ? pendingTotal : dstSize;
         if (!pendingIsConvert) {
             std::memcpy(dst, pendingBgra.data(), n);
@@ -1169,6 +1338,16 @@ struct ReadbackContext {
             context->Unmap(dsOutStaging.Get(), 0);
         }
         pendingScaledTotal = 0;
+        for (size_t i = 0; i < targetDsts.size() && i < targetSlots.size(); ++i) {
+            TargetSlot& slot = targetSlots[i];
+            if (!slot.pending || !targetDsts[i].data || !targetDsts[i].size) continue;
+            size_t tn = slot.pending < targetDsts[i].size ? slot.pending : targetDsts[i].size;
+            D3D11_MAPPED_SUBRESOURCE tmap = {};
+            if (FAILED(context->Map(slot.staging.Get(), 0, D3D11_MAP_READ, 0, &tmap))) { err = "target Map failed"; return false; }
+            ParallelStreamCopyFromWC(targetDsts[i].data, tmap.pData, tn, 4);
+            context->Unmap(slot.staging.Get(), 0);
+            slot.pending = 0;
+        }
         return true;
     }
 };
@@ -1214,9 +1393,18 @@ bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int forma
     return ok;
 }
 
+bool TargetsSupported() { return true; }
+
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
+    return ReadbackConsume(handle, width, height, format, key, dstW, dstH, std::vector<TargetSpec>(), err);
+}
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+    return ReadbackFinish(key, dst, dstSize, scaledDst, scaledSize, std::vector<TargetDst>(), err);
+}
+
+bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
     ReadbackContext* ctx = AcquireContext();
-    bool ok = ctx->ConsumeShared(handle, width, height, format, dstW, dstH, err);
+    bool ok = ctx->ConsumeShared(handle, width, height, format, dstW, dstH, targets, err);
     if (!ok) {
         ReleaseContext(ctx);
         return false;
@@ -1228,7 +1416,7 @@ bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int form
     return true;
 }
 
-bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err) {
     ReadbackContext* ctx = nullptr;
     {
         std::lock_guard<std::mutex> lock(g_pendingMutex);
@@ -1240,7 +1428,7 @@ bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_
         ctx = it->second;
         g_pending.erase(it);
     }
-    bool ok = ctx->ReadPending(dst, dstSize, scaledDst, scaledSize, err);
+    bool ok = ctx->ReadPending(dst, dstSize, scaledDst, scaledSize, targetDsts, err);
     ReleaseContext(ctx);
     return ok;
 }

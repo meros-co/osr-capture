@@ -60,14 +60,19 @@ declare module "osr-capture" {
      * `dstWidth`/`dstHeight` > 0 also GPU-downscales the source to a small tightly-packed BGRA buffer in the
      * SAME pass (for a preview/server/stage consumer); {@link readbackFinish} then resolves `{ main, scaled }`.
      */
-    export function readbackConsume(source: Buffer | DmabufInfo, width: number, height: number, format: ReadbackFormat, poolKey: string, dstWidth?: number, dstHeight?: number): Promise<void>
+    export function readbackConsume(source: Buffer | DmabufInfo, width: number, height: number, format: ReadbackFormat, poolKey: string, dstWidth?: number, dstHeight?: number, targets?: TargetSpec[]): Promise<void>
+
+    /** A per-consumer output of the same pass: the source box-downscaled to width x height, packed as `format`. */
+    export type TargetSpec = { width: number; height: number; format: ReadbackFormat }
+    /** Whether this platform's GPU backend produces {@link TargetSpec} outputs (Windows today). Else derive them on the CPU. */
+    export const targetsSupported: boolean
 
     /**
      * Phase 2 of the two-phase readback (see {@link readbackConsume}). Copies the consumed frame out. Resolves the converted
      * `Buffer` when no downscale was requested, or `{ main, scaled }` when `dstWidth`/`dstHeight` were given to
      * {@link readbackConsume} (`main` = the `format` buffer, `scaled` = `dstWidth * dstHeight * 4` BGRA).
      */
-    export function readbackFinish(poolKey: string, width: number, height: number, format?: ReadbackFormat, dstWidth?: number, dstHeight?: number, dst?: Buffer): Promise<Buffer | { main: Buffer; scaled: Buffer }>
+    export function readbackFinish(poolKey: string, width: number, height: number, format?: ReadbackFormat, dstWidth?: number, dstHeight?: number, dst?: Buffer, targets?: TargetSpec[], targetDsts?: Buffer[]): Promise<Buffer | { main: Buffer; scaled?: Buffer; targets?: Buffer[] }>
 
     /**
      * SINGLE-DISPATCH readback (Windows / Linux-GPU) — the collapse of {@link readbackConsume} + {@link readbackFinish}

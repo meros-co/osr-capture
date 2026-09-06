@@ -551,3 +551,16 @@ const char* ReadbackBackend() {
 }
 
 }  // namespace osrcap
+
+namespace osrcap {
+// Per-consumer targets are not produced by the Metal path yet: the caller downscales/converts on the CPU.
+bool TargetsSupported() { return false; }
+bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
+    if (!targets.empty()) { err = "per-consumer targets are not supported by the macOS backend"; return false; }
+    return ReadbackConsume(handle, width, height, format, key, dstW, dstH, err);
+}
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err) {
+    if (!targetDsts.empty()) { err = "per-consumer targets are not supported by the macOS backend"; return false; }
+    return ReadbackFinish(key, dst, dstSize, scaledDst, scaledSize, err);
+}
+}  // namespace osrcap
