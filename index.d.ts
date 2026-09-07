@@ -62,8 +62,9 @@ declare module "osr-capture" {
      */
     export function readbackConsume(source: Buffer | DmabufInfo, width: number, height: number, format: ReadbackFormat, poolKey: string, dstWidth?: number, dstHeight?: number, targets?: TargetSpec[]): Promise<void>
 
-    /** A per-consumer output of the same pass: the source box-downscaled to width x height, packed as `format`. */
-    export type TargetSpec = { width: number; height: number; format: ReadbackFormat }
+    /** A per-consumer output of the same pass: the source box-downscaled to width x height, packed as `format`
+     *  (0 BGRA, 1 UYVY, 2 UYVA, 4 I420 planar BT.601 limited-range; bytes = w*h + 2*(w/2)*(h/2)). */
+    export type TargetSpec = { width: number; height: number; format: ReadbackFormat | 4 }
     /** Whether this platform's GPU backend produces {@link TargetSpec} outputs (Windows today). Else derive them on the CPU. */
     export const targetsSupported: boolean
 

@@ -436,6 +436,7 @@ cbuffer ScParams : register(b0) {
 };
 int toByte(float v) { return (int)(v * 255.0 + 0.5); }
 float4 boxAvg(uint dx, uint dy) {
+    if (gSrcW == gDstW && gSrcH == gDstH) return gSrc.Load(int3(dx, dy, 0));
     uint sx0 = dx * gSrcW / gDstW;
     uint sx1 = (dx + 1) * gSrcW / gDstW; if (sx1 <= sx0) sx1 = sx0 + 1;
     uint sy0 = dy * gSrcH / gDstH;
@@ -481,6 +482,80 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
             uint aword = (uint)toByte(c0.a) | ((uint)toByte(c1.a)<<8) | ((uint)toByte(c2.a)<<16) | ((uint)toByte(c3.a)<<24);
             gDst.Store(gUyvySize + y * gDstW + px, aword);
         }
+    }
+}
+)HLSL";
+
+// I420 (planar 4:2:0, BT.601 limited range) target: one thread per 8x2 block writes two Y words per row
+// and one U + one V word (4 chroma samples), so every store is a whole 32-bit word. Widths that are not
+// multiples of 8 keep their trailing partial words unwritten (guarded), which the caller sizes to avoid.
+const char* kScaleI420HLSL = R"HLSL(
+Texture2D<float4> gSrc : register(t0);
+RWByteAddressBuffer gDst : register(u0);
+cbuffer ScParams : register(b0) {
+    uint gSrcW; uint gSrcH; uint gDstW; uint gDstH;
+    uint gFormat; uint gUyvySize; uint gPad0; uint gPad1;
+};
+float4 boxAvg(uint dx, uint dy) {
+    if (gSrcW == gDstW && gSrcH == gDstH) return gSrc.Load(int3(dx, dy, 0));
+    uint sx0 = dx * gSrcW / gDstW;
+    uint sx1 = (dx + 1) * gSrcW / gDstW; if (sx1 <= sx0) sx1 = sx0 + 1;
+    uint sy0 = dy * gSrcH / gDstH;
+    uint sy1 = (dy + 1) * gSrcH / gDstH; if (sy1 <= sy0) sy1 = sy0 + 1;
+    float4 acc = float4(0, 0, 0, 0);
+    uint cnt = 0;
+    for (uint y = sy0; y < sy1; ++y) {
+        for (uint x = sx0; x < sx1; ++x) { acc += gSrc.Load(int3(x, y, 0)); ++cnt; }
+    }
+    return acc / cnt;
+}
+uint lumaOf(float4 c) {
+    int r = (int)(c.r * 255.0 + 0.5), g = (int)(c.g * 255.0 + 0.5), b = (int)(c.b * 255.0 + 0.5);
+    return (uint)clamp(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16, 16, 235);
+}
+[numthreads(8, 8, 1)]
+void SCI420Main(uint3 tid : SV_DispatchThreadID) {
+    uint bx = tid.x * 8;
+    uint by = tid.y * 2;
+    if (bx >= gDstW || by >= gDstH) return;
+    uint ySize = gDstW * gDstH;
+    uint cw = gDstW / 2;
+    uint ch = gDstH / 2;
+    float4 c[16];
+    [unroll] for (uint r = 0; r < 2; ++r) {
+        [unroll] for (uint i = 0; i < 8; ++i) {
+            uint dx = min(bx + i, gDstW - 1);
+            uint dy = min(by + r, gDstH - 1);
+            c[r * 8 + i] = boxAvg(dx, dy);
+        }
+    }
+    [unroll] for (uint r2 = 0; r2 < 2; ++r2) {
+        if (by + r2 >= gDstH) continue;
+        uint rowOff = (by + r2) * gDstW + bx;
+        if (bx + 3 < gDstW) {
+            uint w0 = lumaOf(c[r2 * 8 + 0]) | (lumaOf(c[r2 * 8 + 1]) << 8) | (lumaOf(c[r2 * 8 + 2]) << 16) | (lumaOf(c[r2 * 8 + 3]) << 24);
+            gDst.Store(rowOff, w0);
+        }
+        if (bx + 7 < gDstW) {
+            uint w1 = lumaOf(c[r2 * 8 + 4]) | (lumaOf(c[r2 * 8 + 5]) << 8) | (lumaOf(c[r2 * 8 + 6]) << 16) | (lumaOf(c[r2 * 8 + 7]) << 24);
+            gDst.Store(rowOff + 4, w1);
+        }
+    }
+    uint cy = by / 2;
+    uint cx = bx / 2;
+    if (cy < ch && cx + 3 < cw) {
+        uint uw = 0, vw = 0;
+        [unroll] for (uint k = 0; k < 4; ++k) {
+            float4 a = (c[k * 2] + c[k * 2 + 1] + c[8 + k * 2] + c[8 + k * 2 + 1]) * 0.25;
+            int r = (int)(a.r * 255.0 + 0.5), g = (int)(a.g * 255.0 + 0.5), b = (int)(a.b * 255.0 + 0.5);
+            uint u = (uint)clamp(((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128, 16, 240);
+            uint v = (uint)clamp(((112 * r - 94 * g - 18 * b + 128) >> 8) + 128, 16, 240);
+            uw |= u << (k * 8);
+            vw |= v << (k * 8);
+        }
+        uint cOff = cy * cw + cx;
+        gDst.Store(ySize + cOff, uw);
+        gDst.Store(ySize + cw * ch + cOff, vw);
     }
 }
 )HLSL";
@@ -553,6 +628,7 @@ struct ReadbackContext {
 
     // per-consumer targets (osrcap::TargetSpec): downscale+convert in one pass, one slot per target
     ComPtr<ID3D11ComputeShader> scShader;
+    ComPtr<ID3D11ComputeShader> scI420Shader;
     ComPtr<ID3D11Buffer> scParamsCb;
     struct TargetSlot {
         ComPtr<ID3D11Buffer> buf;
@@ -932,11 +1008,16 @@ struct ReadbackContext {
     }
 
     bool EnsureScShader() {
-        if (scShader) return true;
+        if (scShader && scI420Shader) return true;
         ComPtr<ID3DBlob> blob, errBlob;
         HRESULT hr = D3DCompile(kScaleConvertHLSL, strlen(kScaleConvertHLSL), "scaleconvert.hlsl", nullptr, nullptr, "SCMain", "cs_5_0", 0, 0, &blob, &errBlob);
         if (FAILED(hr)) return false;
         if (FAILED(device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &scShader))) return false;
+        ComPtr<ID3DBlob> blob2, errBlob2;
+        hr = D3DCompile(kScaleI420HLSL, strlen(kScaleI420HLSL), "scalei420.hlsl", nullptr, nullptr, "SCI420Main", "cs_5_0", 0, 0, &blob2, &errBlob2);
+        if (FAILED(hr)) return false;
+        if (FAILED(device->CreateComputeShader(blob2->GetBufferPointer(), blob2->GetBufferSize(), nullptr, &scI420Shader))) return false;
+        if (scParamsCb) return true;
         D3D11_BUFFER_DESC cb = {};
         cb.ByteWidth = sizeof(ScParams);
         cb.Usage = D3D11_USAGE_DEFAULT;
@@ -987,11 +1068,13 @@ struct ReadbackContext {
         ID3D11ShaderResourceView* srvs[] = { srv.Get() };
         ID3D11UnorderedAccessView* uavs[] = { slot.uav.Get() };
         ID3D11Buffer* cbs[] = { scParamsCb.Get() };
-        context->CSSetShader(scShader.Get(), nullptr, 0);
+        const bool i420 = t.format == 4;
+        context->CSSetShader(i420 ? scI420Shader.Get() : scShader.Get(), nullptr, 0);
         context->CSSetShaderResources(0, 1, srvs);
         context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
         context->CSSetConstantBuffers(0, 1, cbs);
-        context->Dispatch(((t.w + 1) / 2 + 7) / 8, (t.h + 7) / 8, 1);
+        if (i420) context->Dispatch((t.w + 7) / 8, (t.h + 1) / 2, 1);
+        else context->Dispatch(((t.w + 1) / 2 + 7) / 8, (t.h + 7) / 8, 1);
         ID3D11ShaderResourceView* nullSrv[] = { nullptr };
         ID3D11UnorderedAccessView* nullUav[] = { nullptr };
         context->CSSetShaderResources(0, 1, nullSrv);

@@ -11,8 +11,9 @@
 namespace osrcap {
 
 // A per-consumer output produced from the same shared texture in the same GPU pass as the main readback:
-// the source box-downscaled to w x h and packed as `format` (0 BGRA, 1 UYVY, 2 UYVA). One render can
-// feed outputs of several resolutions with one readback (render once at the largest, downscale the rest).
+// the source box-downscaled to w x h and packed as `format` (0 BGRA, 1 UYVY, 2 UYVA, 4 I420 planar
+// Y/U/V, BT.601 limited range — what a video encoder wants). One render can feed outputs of several
+// resolutions with one readback (render once at the largest, downscale the rest).
 struct TargetSpec {
     uint32_t w = 0;
     uint32_t h = 0;
@@ -25,6 +26,7 @@ struct TargetDst {
 };
 inline size_t TargetBytes(const TargetSpec& t) {
     size_t px = static_cast<size_t>(t.w) * t.h;
+    if (t.format == 4) return px + 2 * (static_cast<size_t>(t.w / 2) * (t.h / 2));
     return t.format == 1 ? px * 2 : (t.format == 2 ? px * 3 : px * 4);
 }
 // Whether this platform's GPU backend produces TargetSpec outputs (Windows D3D11 today).
