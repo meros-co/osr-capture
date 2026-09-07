@@ -17,4 +17,5 @@
 //   releasePool(poolKey)                                  // free a poolKey's reused output buffers
 //   convertBgraToUyvy / convertBgraToUyva(bgra, w, h)     // CPU fallback converters (sync)
 //   downscaleBgra(bgra, srcW, srcH, dstW, dstH)           // CPU box-filter downscale (sync)
+//   shmMap(name, bytes, create) / shmWrite / shmRead(name, offset, u8) [+ ...Async] / shmUnmap(name)          // named shared memory between processes (see index.d.ts)
 module.exports = require("./build/Release/osr_readback.node")

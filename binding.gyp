@@ -2,7 +2,7 @@
     "targets": [
         {
             "target_name": "osr_readback",
-            "sources": ["src/osr_readback.cc", "src/convert.cc"],
+            "sources": ["src/osr_readback.cc", "src/convert.cc", "src/shm.cc"],
             "include_dirs": ["<!@(node -p \"require('node-addon-api').include\")"],
             "defines": ["NAPI_VERSION=8"],
             "conditions": [

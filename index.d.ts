@@ -99,3 +99,22 @@ declare module "osr-capture" {
      */
     export function downscaleBgra(bgra: Buffer, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Buffer
 }
+
+/**
+ * Named shared memory (a file mapping on Windows, shm_open on POSIX) for handing frames between
+ * processes without serializing them. The same name maps the same bytes in every process that maps it.
+ * Electron forbids external ArrayBuffers, so the mapping is read and written through shmRead/shmWrite
+ * (one memcpy each). `create` = true creates the region (the creator removes the name on POSIX when it
+ * unmaps); false opens an existing one. Names should be short (macOS limits them to 31 characters).
+ */
+export function shmMap(name: string, bytes: number, create: boolean): boolean
+/** copy `bytes` into the mapping at `offset`; returns the byte count */
+export function shmWrite(name: string, offset: number, bytes: Uint8Array): number
+/** fill `bytes` from the mapping at `offset`; returns the byte count */
+export function shmRead(name: string, offset: number, bytes: Uint8Array): number
+/** shmWrite on the thread pool; `bytes` must not be touched until it resolves */
+export function shmWriteAsync(name: string, offset: number, bytes: Uint8Array): Promise<number>
+/** shmRead on the thread pool; `bytes` must not be touched until it resolves */
+export function shmReadAsync(name: string, offset: number, bytes: Uint8Array): Promise<number>
+/** release this process's mapping of `name`; true if it was mapped */
+export function shmUnmap(name: string): boolean

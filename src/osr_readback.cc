@@ -581,6 +581,7 @@ Napi::Value ReleasePool(const Napi::CallbackInfo& info) {
 namespace osrcap {
 void RegisterConvert(Napi::Env env, Napi::Object exports);
 }
+void InitShm(Napi::Env env, Napi::Object exports);
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
     // Per-env pool storage (see AddonData). N-API runs Init once per env (main thread + each worker), and
@@ -620,6 +621,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("_copyPoolActiveWorkers", Napi::Function::New(env, CopyPoolActiveWorkersJs));
 #endif
     osrcap::RegisterConvert(env, exports);
+    InitShm(env, exports);
     return exports;
 }
 
