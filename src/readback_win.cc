@@ -319,8 +319,9 @@ float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
     float4 s = gVideo.Load(int3(vx / 2, vy, 0));
     float luma = ((vx & 1) == 0) ? s.g : s.a;
     float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
-    float u = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
-    float v = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    // the layer texture is BGRA, so the UYVY bytes U,Y0,V,Y1 arrive as .b,.g,.r,.a
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
     float bt = (gVideoH >= 720) ? 1.0 : 0.0;
     float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
     float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
@@ -431,7 +432,29 @@ Texture2D<float4> gSrc : register(t0);
 RWByteAddressBuffer gDst : register(u0);
 cbuffer DsParams : register(b0) {
     uint gSrcW; uint gSrcH; uint gDstW; uint gDstH;
+    uint gVideoOn; uint gVideoW; uint gVideoH; uint gVideoFormat;
 };
+Texture2D<float4> gVideo : register(t1);
+float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
+    uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
+    uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
+    float4 s = gVideo.Load(int3(vx / 2, vy, 0));
+    float luma = ((vx & 1) == 0) ? s.g : s.a;
+    float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
+    // the layer texture is BGRA, so the UYVY bytes U,Y0,V,Y1 arrive as .b,.g,.r,.a
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
+    float bt = (gVideoH >= 720) ? 1.0 : 0.0;
+    float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
+    float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
+    return saturate(float3(yy + kr * v, yy - gu * u - gv * v, yy + kb * u));
+}
+float4 overVideo(float4 page, uint x, uint y, uint dstW, uint dstH) {
+    if (gVideoOn == 0 || page.a >= 0.999) return page;
+    return float4(page.rgb + videoAt(x, y, dstW, dstH) * (1.0 - page.a), 1.0);
+}
 int toByte(float v) { return (int)(v * 255.0 + 0.5); }
 [numthreads(8, 8, 1)]
 void DSMain(uint3 tid : SV_DispatchThreadID) {
@@ -445,7 +468,7 @@ void DSMain(uint3 tid : SV_DispatchThreadID) {
     for (uint y = sy0; y < sy1; ++y) {
         for (uint x = sx0; x < sx1; ++x) { acc += gSrc.Load(int3(x, y, 0)); ++cnt; }
     }
-    acc /= cnt;
+    acc = overVideo(acc / cnt, tid.x, tid.y, gDstW, gDstH);
     uint word = (uint)toByte(acc.b) | ((uint)toByte(acc.g) << 8) | ((uint)toByte(acc.r) << 16) | ((uint)toByte(acc.a) << 24);
     gDst.Store((tid.y * gDstW + tid.x) * 4, word);
 }
@@ -456,6 +479,10 @@ struct DsParams {
     uint32_t srcH;
     uint32_t dstW;
     uint32_t dstH;
+    uint32_t videoOn;
+    uint32_t videoW;
+    uint32_t videoH;
+    uint32_t videoFormat;
 };
 
 // Per-consumer target: box-downscale the shared BGRA to dstW x dstH and pack straight into the consumer's
@@ -484,8 +511,9 @@ float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
     float4 s = gVideo.Load(int3(vx / 2, vy, 0));
     float luma = ((vx & 1) == 0) ? s.g : s.a;
     float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
-    float u = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
-    float v = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    // the layer texture is BGRA, so the UYVY bytes U,Y0,V,Y1 arrive as .b,.g,.r,.a
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
     float bt = (gVideoH >= 720) ? 1.0 : 0.0;
     float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
     float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
@@ -570,8 +598,9 @@ float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
     float4 s = gVideo.Load(int3(vx / 2, vy, 0));
     float luma = ((vx & 1) == 0) ? s.g : s.a;
     float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
-    float u = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
-    float v = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    // the layer texture is BGRA, so the UYVY bytes U,Y0,V,Y1 arrive as .b,.g,.r,.a
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
     float bt = (gVideoH >= 720) ? 1.0 : 0.0;
     float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
     float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
@@ -1256,19 +1285,19 @@ struct ReadbackContext {
         sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         sv.Texture2D.MipLevels = 1;
         if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "downscale SRV creation failed"; return false; }
-        DsParams p{ srcW, srcH, dstW, dstH };
+        DsParams p{ srcW, srcH, dstW, dstH, videoOn ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
         context->UpdateSubresource(dsParamsCb.Get(), 0, nullptr, &p, 0, 0);
-        ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+        ID3D11ShaderResourceView* srvs[] = { srv.Get(), VideoSrv() };
         ID3D11UnorderedAccessView* uavs[] = { dsOutUav.Get() };
         ID3D11Buffer* cbs[] = { dsParamsCb.Get() };
         context->CSSetShader(dsShader.Get(), nullptr, 0);
-        context->CSSetShaderResources(0, 1, srvs);
+        context->CSSetShaderResources(0, 2, srvs);
         context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
         context->CSSetConstantBuffers(0, 1, cbs);
         context->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
-        ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+        ID3D11ShaderResourceView* nullSrv[] = { nullptr, nullptr };
         ID3D11UnorderedAccessView* nullUav[] = { nullptr };
-        context->CSSetShaderResources(0, 1, nullSrv);
+        context->CSSetShaderResources(0, 2, nullSrv);
         context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
         context->CopyResource(dsOutStaging.Get(), dsOutBuf.Get());
         return true;
@@ -1461,10 +1490,13 @@ struct ReadbackContext {
     }
 
     bool ConsumeShared(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH, const std::vector<osrcap::TargetSpec>& targets, const osrcap::VideoLayer& video, std::string& err) {
+        // The video upload runs BEFORE the shared texture is opened: everything between opening it and
+        // the convert is time Electron's frame pool is waiting on us, and a 4K upload in there costs
+        // paints. EnsureDevice is what OpenSharedTex would call anyway.
+        if (video.w && !EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
+        if (!SetVideoLayer(video, err)) return false;
         ComPtr<ID3D11Texture2D> shared;
         if (!OpenSharedTex(handle, shared, err)) return false;
-        // after OpenSharedTex: it creates this context's device on first use
-        if (!SetVideoLayer(video, err)) return false;
 
         ComPtr<IDXGIKeyedMutex> keyedMutex;
         bool haveKeyedMutex = SUCCEEDED(shared.As(&keyedMutex)) && keyedMutex;

@@ -1,0 +1,177 @@
+﻿[CFG] 3840x2160 alt=2560x1440 fmt=1 streams=3 fps=60 soakSecs=45 rateSecs=10 report=5s validate=1 variants=on12 d3d11 mutex=1 0
+[PROBE] producer float->unorm round-trip byte-exact: PASS
+[EXPECTED] built 3840x2160 fmt1 x16 patterns in 0.1s (265 MB)
+[EXPECTED] built 2560x1440 fmt1 x16 patterns in 0.0s (118 MB)
+
+[PHASE] soak variant=on12 mutex=1 streams=3 fps=60 secs=45 resize=1 stopstart=1
+[W] on12 m1 s0 t=5s fps=58.8 sched=3.59 convGpu=1.32 copyQ=1.56 copyOut=3.10(5358MB/s) val=4.03 tot=9.56 max=23.4 mism=0 skip=1
+[W] on12 m1 s1 t=5s fps=58.6 sched=4.19 convGpu=0.88 copyQ=1.73 copyOut=3.12(5312MB/s) val=3.86 tot=9.93 max=51.8 mism=0 skip=2
+[W] on12 m1 s2 t=5s fps=58.8 sched=4.24 convGpu=0.90 copyQ=1.65 copyOut=3.11(5340MB/s) val=3.70 tot=9.90 max=35.1 mism=0 skip=1
+[W] on12 m1 s0 t=10s fps=60.2 sched=3.59 convGpu=1.25 copyQ=1.57 copyOut=3.14(5275MB/s) val=4.07 tot=9.55 max=17.5 mism=0 skip=1
+[W] on12 m1 s1 t=10s fps=60.2 sched=4.23 convGpu=0.85 copyQ=1.74 copyOut=3.20(5186MB/s) val=3.87 tot=10.01 max=16.0 mism=0 skip=2
+[W] on12 m1 s2 t=10s fps=60.2 sched=4.07 convGpu=0.92 copyQ=1.68 copyOut=3.17(5225MB/s) val=3.80 tot=9.84 max=17.5 mism=0 skip=1
+[W] on12 m1 s0 t=15s fps=60.0 sched=3.70 convGpu=1.09 copyQ=1.50 copyOut=2.92(5674MB/s) val=3.70 tot=9.22 max=16.4 mism=0 skip=1
+[W] on12 m1 s1 t=15s fps=60.0 sched=4.09 convGpu=0.80 copyQ=1.63 copyOut=2.95(5617MB/s) val=3.60 tot=9.48 max=29.5 mism=0 skip=2
+[W] on12 m1 s2 t=15s fps=60.0 sched=4.17 convGpu=0.79 copyQ=1.58 copyOut=2.95(5618MB/s) val=3.45 tot=9.49 max=21.9 mism=0 skip=1
+[W] on12 m1 s0 t=20s fps=60.2 sched=2.23 convGpu=1.18 copyQ=0.82 copyOut=1.30(5654MB/s) val=1.53 tot=5.54 max=11.9 mism=0 skip=1
+[W] on12 m1 s1 t=20s fps=60.2 sched=2.48 convGpu=0.94 copyQ=0.90 copyOut=1.32(5593MB/s) val=1.48 tot=5.64 max=9.7 mism=0 skip=2
+[W] on12 m1 s2 t=20s fps=60.2 sched=2.51 convGpu=0.83 copyQ=0.91 copyOut=1.32(5572MB/s) val=1.40 tot=5.57 max=12.0 mism=0 skip=1
+[W] on12 m1 s0 t=25s fps=56.6 sched=2.12 convGpu=0.87 copyQ=0.73 copyOut=1.08(6815MB/s) val=1.59 tot=4.81 max=12.8 mism=0 skip=1
+[W] on12 m1 s1 t=25s fps=56.6 sched=2.27 convGpu=0.73 copyQ=0.74 copyOut=1.10(6723MB/s) val=1.54 tot=4.84 max=13.2 mism=0 skip=2
+[W] on12 m1 s2 t=25s fps=56.6 sched=2.44 convGpu=0.66 copyQ=0.79 copyOut=1.12(6566MB/s) val=1.25 tot=5.01 max=12.8 mism=0 skip=1
+[W] on12 m1 s0 t=30s fps=59.8 sched=1.99 convGpu=0.18 copyQ=0.59 copyOut=1.06(6958MB/s) val=1.87 tot=3.82 max=13.0 mism=0 skip=1
+[W] on12 m1 s1 t=30s fps=59.8 sched=2.02 convGpu=0.20 copyQ=0.59 copyOut=1.01(7294MB/s) val=1.89 tot=3.82 max=13.6 mism=0 skip=2
+[W] on12 m1 s2 t=30s fps=59.8 sched=2.47 convGpu=0.22 copyQ=0.61 copyOut=1.13(6508MB/s) val=1.19 tot=4.43 max=11.0 mism=0 skip=1
+[W] on12 m1 s0 t=35s fps=60.2 sched=3.39 convGpu=0.32 copyQ=1.21 copyOut=2.46(6750MB/s) val=3.73 tot=7.38 max=20.6 mism=0 skip=2
+[W] on12 m1 s1 t=35s fps=60.2 sched=3.39 convGpu=0.30 copyQ=1.20 copyOut=2.34(7102MB/s) val=3.84 tot=7.23 max=21.0 mism=0 skip=3
+[W] on12 m1 s2 t=35s fps=60.2 sched=4.90 convGpu=0.37 copyQ=1.21 copyOut=2.45(6773MB/s) val=2.47 tot=8.94 max=19.6 mism=0 skip=2
+[W] on12 m1 s0 t=40s fps=60.0 sched=3.42 convGpu=0.32 copyQ=1.24 copyOut=2.80(5931MB/s) val=4.08 tot=7.77 max=18.3 mism=0 skip=2
+[W] on12 m1 s1 t=40s fps=60.0 sched=3.43 convGpu=0.34 copyQ=1.21 copyOut=2.72(6109MB/s) val=4.24 tot=7.70 max=19.3 mism=0 skip=3
+[W] on12 m1 s2 t=40s fps=60.0 sched=4.84 convGpu=0.34 copyQ=1.29 copyOut=2.76(6016MB/s) val=2.95 tot=9.23 max=20.6 mism=0 skip=2
+[W] on12 m1 s0 t=45s fps=60.2 sched=3.42 convGpu=0.28 copyQ=1.21 copyOut=2.65(6269MB/s) val=3.81 tot=7.55 max=22.9 mism=0 skip=2
+[W] on12 m1 s1 t=45s fps=60.2 sched=3.29 convGpu=0.29 copyQ=1.19 copyOut=2.50(6642MB/s) val=4.00 tot=7.27 max=17.3 mism=0 skip=3
+[W] on12 m1 s2 t=45s fps=60.2 sched=4.70 convGpu=0.32 copyQ=1.23 copyOut=2.61(6345MB/s) val=2.73 tot=8.87 max=23.4 mism=0 skip=2
+[PHASE-END] soak on12 m1 streams=3 wall=45.1s fps/stream=59.5 consumerCPU=1.01 cores (validate~0.53) producerCPU=0.03 processCPU=1.09
+
+[PHASE] soak variant=on12 mutex=0 streams=3 fps=60 secs=45 resize=1 stopstart=1
+[W] on12 m0 s0 t=5s fps=58.8 sched=3.26 convGpu=0.78 copyQ=1.22 copyOut=2.38(6975MB/s) val=4.00 tot=7.64 max=23.6 mism=0 skip=1
+[W] on12 m0 s1 t=5s fps=58.8 sched=3.89 convGpu=0.57 copyQ=1.35 copyOut=2.53(6544MB/s) val=3.43 tot=8.34 max=36.5 mism=0 skip=1
+[W] on12 m0 s2 t=5s fps=58.6 sched=3.98 convGpu=0.55 copyQ=1.36 copyOut=2.60(6380MB/s) val=3.44 tot=8.48 max=55.4 mism=0 skip=2
+[W] on12 m0 s0 t=10s fps=60.2 sched=3.39 convGpu=0.76 copyQ=1.33 copyOut=2.67(6223MB/s) val=4.06 tot=8.14 max=14.2 mism=0 skip=1
+[W] on12 m0 s1 t=10s fps=60.2 sched=3.63 convGpu=0.72 copyQ=1.29 copyOut=2.77(5991MB/s) val=3.89 tot=8.41 max=14.1 mism=0 skip=1
+[W] on12 m0 s2 t=10s fps=60.2 sched=3.93 convGpu=0.38 copyQ=1.37 copyOut=2.77(5981MB/s) val=3.63 tot=8.46 max=17.6 mism=0 skip=2
+[W] on12 m0 s0 t=15s fps=60.0 sched=3.28 convGpu=0.55 copyQ=1.19 copyOut=2.22(7479MB/s) val=3.77 tot=7.23 max=18.8 mism=0 skip=1
+[W] on12 m0 s1 t=15s fps=60.0 sched=3.81 convGpu=0.40 copyQ=1.23 copyOut=2.33(7106MB/s) val=3.37 tot=7.78 max=20.1 mism=0 skip=1
+[W] on12 m0 s2 t=15s fps=60.0 sched=3.91 convGpu=0.38 copyQ=1.22 copyOut=2.45(6769MB/s) val=3.27 tot=7.96 max=20.0 mism=0 skip=2
+[W] on12 m0 s0 t=20s fps=60.4 sched=2.18 convGpu=0.17 copyQ=0.58 copyOut=0.89(8253MB/s) val=1.42 tot=3.82 max=8.9 mism=0 skip=1
+[W] on12 m0 s1 t=20s fps=60.4 sched=2.33 convGpu=0.18 copyQ=0.58 copyOut=0.92(7983MB/s) val=1.33 tot=4.02 max=16.0 mism=0 skip=1
+[W] on12 m0 s2 t=20s fps=60.4 sched=2.52 convGpu=0.18 copyQ=0.58 copyOut=0.88(8412MB/s) val=1.25 tot=4.16 max=11.3 mism=0 skip=2
+[W] on12 m0 s0 t=25s fps=56.6 sched=2.05 convGpu=0.19 copyQ=0.58 copyOut=0.97(7573MB/s) val=1.43 tot=3.80 max=11.9 mism=0 skip=1
+[W] on12 m0 s1 t=25s fps=56.6 sched=2.26 convGpu=0.20 copyQ=0.59 copyOut=0.99(7479MB/s) val=1.16 tot=4.04 max=16.6 mism=0 skip=1
+[W] on12 m0 s2 t=25s fps=56.6 sched=2.04 convGpu=0.21 copyQ=0.59 copyOut=0.81(9101MB/s) val=1.56 tot=3.65 max=12.7 mism=0 skip=2
+[W] on12 m0 s0 t=30s fps=59.6 sched=1.83 convGpu=0.19 copyQ=0.59 copyOut=1.02(7229MB/s) val=1.37 tot=3.63 max=13.0 mism=0 skip=1
+[W] on12 m0 s1 t=30s fps=59.6 sched=2.07 convGpu=0.20 copyQ=0.61 copyOut=1.00(7398MB/s) val=0.98 tot=3.87 max=12.8 mism=0 skip=1
+[W] on12 m0 s2 t=30s fps=59.8 sched=1.60 convGpu=0.19 copyQ=0.60 copyOut=0.65(11349MB/s) val=1.61 tot=3.05 max=13.6 mism=0 skip=2
+[W] on12 m0 s0 t=35s fps=60.4 sched=3.36 convGpu=0.32 copyQ=1.27 copyOut=3.06(5413MB/s) val=3.49 tot=8.02 max=18.1 mism=0 skip=1
+[W] on12 m0 s1 t=35s fps=60.2 sched=4.08 convGpu=0.37 copyQ=1.29 copyOut=2.90(5728MB/s) val=2.80 tot=8.64 max=20.6 mism=0 skip=2
+[W] on12 m0 s2 t=35s fps=60.4 sched=2.41 convGpu=0.30 copyQ=1.18 copyOut=2.47(6713MB/s) val=4.92 tot=6.36 max=16.8 mism=0 skip=2
+[W] on12 m0 s0 t=40s fps=60.2 sched=3.42 convGpu=0.39 copyQ=1.31 copyOut=3.34(4969MB/s) val=3.74 tot=8.46 max=18.9 mism=0 skip=1
+[W] on12 m0 s1 t=40s fps=60.2 sched=4.19 convGpu=0.44 copyQ=1.34 copyOut=3.11(5338MB/s) val=3.07 tot=9.07 max=19.9 mism=0 skip=2
+[W] on12 m0 s2 t=40s fps=60.0 sched=2.48 convGpu=0.29 copyQ=1.22 copyOut=2.77(5986MB/s) val=5.29 tot=6.77 max=17.2 mism=0 skip=2
+[W] on12 m0 s0 t=45s fps=60.2 sched=3.05 convGpu=0.26 copyQ=1.20 copyOut=2.72(6092MB/s) val=3.15 tot=7.23 max=11.6 mism=0 skip=1
+[W] on12 m0 s1 t=45s fps=60.2 sched=3.91 convGpu=0.30 copyQ=1.22 copyOut=2.58(6433MB/s) val=2.35 tot=8.01 max=12.9 mism=0 skip=2
+[W] on12 m0 s2 t=45s fps=60.2 sched=2.22 convGpu=0.27 copyQ=1.16 copyOut=2.08(7960MB/s) val=4.61 tot=5.74 max=10.3 mism=0 skip=2
+[PHASE-END] soak on12 m0 streams=3 wall=45.1s fps/stream=59.5 consumerCPU=0.99 cores (validate~0.52) producerCPU=0.25 processCPU=1.28
+
+[PHASE] soak variant=d3d11 mutex=1 streams=3 fps=60 secs=45 resize=1 stopstart=1
+[W] d3d11 m1 s0 t=5s fps=57.8 consume=5.52 copyOutWC=2.78(5965MB/s) val=4.72 tot=8.30 max=22.0 mism=0 skip=6
+[W] d3d11 m1 s1 t=5s fps=58.4 consume=6.10 copyOutWC=3.07(5397MB/s) val=4.06 tot=9.17 max=19.4 mism=0 skip=3
+[W] d3d11 m1 s2 t=5s fps=57.0 consume=6.55 copyOutWC=3.20(5190MB/s) val=3.76 tot=9.74 max=21.5 mism=0 skip=10
+[W] d3d11 m1 s0 t=10s fps=60.0 consume=5.82 copyOutWC=2.87(5785MB/s) val=4.96 tot=8.69 max=35.2 mism=0 skip=6
+[W] d3d11 m1 s1 t=10s fps=60.0 consume=6.34 copyOutWC=3.17(5233MB/s) val=4.53 tot=9.51 max=38.6 mism=0 skip=3
+[W] d3d11 m1 s2 t=10s fps=60.2 consume=6.60 copyOutWC=3.16(5257MB/s) val=4.26 tot=9.76 max=20.0 mism=0 skip=10
+[W] d3d11 m1 s0 t=15s fps=60.2 consume=5.86 copyOutWC=2.56(6477MB/s) val=4.36 tot=8.42 max=16.7 mism=0 skip=6
+[W] d3d11 m1 s1 t=15s fps=60.2 consume=6.27 copyOutWC=2.71(6132MB/s) val=4.11 tot=8.97 max=21.2 mism=0 skip=3
+[W] d3d11 m1 s2 t=15s fps=60.0 consume=5.93 copyOutWC=2.63(6298MB/s) val=4.42 tot=8.56 max=18.8 mism=0 skip=10
+[W] d3d11 m1 s0 t=20s fps=60.2 consume=3.48 copyOutWC=0.91(8066MB/s) val=1.61 tot=4.39 max=14.6 mism=0 skip=6
+[W] d3d11 m1 s1 t=20s fps=60.2 consume=3.84 copyOutWC=0.95(7797MB/s) val=1.55 tot=4.79 max=16.0 mism=0 skip=3
+[W] d3d11 m1 s2 t=20s fps=60.2 consume=4.04 copyOutWC=0.97(7577MB/s) val=1.41 tot=5.02 max=15.5 mism=0 skip=10
+[W] d3d11 m1 s0 t=25s fps=56.6 consume=5.25 copyOutWC=1.05(7003MB/s) val=1.34 tot=6.31 max=12.3 mism=0 skip=6
+[W] d3d11 m1 s1 t=25s fps=56.8 consume=4.25 copyOutWC=0.92(7980MB/s) val=1.45 tot=5.17 max=10.7 mism=0 skip=3
+[W] d3d11 m1 s2 t=25s fps=56.6 consume=5.26 copyOutWC=1.03(7142MB/s) val=1.36 tot=6.29 max=11.6 mism=0 skip=10
+[W] d3d11 m1 s0 t=30s fps=59.8 consume=7.08 copyOutWC=1.20(6142MB/s) val=1.00 tot=8.28 max=12.9 mism=0 skip=6
+[W] d3d11 m1 s1 t=30s fps=59.6 consume=4.37 copyOutWC=0.91(8112MB/s) val=1.07 tot=5.28 max=11.8 mism=0 skip=3
+[W] d3d11 m1 s2 t=30s fps=59.8 consume=6.69 copyOutWC=1.16(6369MB/s) val=1.08 tot=7.84 max=10.2 mism=0 skip=10
+[W] d3d11 m1 s0 t=35s fps=60.2 consume=8.68 copyOutWC=3.98(4171MB/s) val=3.24 tot=12.65 max=38.5 mism=0 skip=6
+[W] d3d11 m1 s1 t=35s fps=60.4 consume=7.40 copyOutWC=2.68(6192MB/s) val=3.83 tot=10.08 max=40.9 mism=0 skip=3
+[W] d3d11 m1 s2 t=35s fps=60.2 consume=8.77 copyOutWC=3.82(4343MB/s) val=3.25 tot=12.59 max=43.0 mism=0 skip=11
+[W] d3d11 m1 s0 t=40s fps=60.2 consume=8.84 copyOutWC=3.88(4276MB/s) val=3.31 tot=12.71 max=18.0 mism=0 skip=6
+[W] d3d11 m1 s1 t=40s fps=60.0 consume=7.24 copyOutWC=2.74(6060MB/s) val=3.64 tot=9.98 max=17.2 mism=0 skip=3
+[W] d3d11 m1 s2 t=40s fps=60.0 consume=8.85 copyOutWC=3.66(4531MB/s) val=3.44 tot=12.52 max=19.7 mism=0 skip=11
+[W] d3d11 m1 s0 t=45s fps=60.2 consume=9.00 copyOutWC=3.55(4677MB/s) val=3.02 tot=12.55 max=22.8 mism=0 skip=6
+[W] d3d11 m1 s1 t=45s fps=60.2 consume=6.46 copyOutWC=2.44(6810MB/s) val=3.25 tot=8.90 max=18.3 mism=0 skip=3
+[W] d3d11 m1 s2 t=45s fps=60.2 consume=8.76 copyOutWC=3.27(5071MB/s) val=3.13 tot=12.03 max=19.8 mism=0 skip=11
+[PHASE-END] soak d3d11 m1 streams=3 wall=45.1s fps/stream=59.4 consumerCPU=1.35 cores (validate~0.54) producerCPU=0.04 processCPU=2.28
+
+[PHASE] soak variant=d3d11 mutex=0 streams=3 fps=60 secs=45 resize=1 stopstart=1
+[W] d3d11 m0 s0 t=5s fps=59.2 consume=6.62 copyOutWC=2.84(5835MB/s) val=3.26 tot=9.46 max=17.3 mism=0 skip=0
+[W] d3d11 m0 s1 t=5s fps=59.0 consume=6.86 copyOutWC=2.94(5651MB/s) val=3.04 tot=9.80 max=17.4 mism=0 skip=0
+[W] d3d11 m0 s2 t=5s fps=59.0 consume=6.63 copyOutWC=2.88(5757MB/s) val=3.24 tot=9.51 max=19.6 mism=0 skip=0
+[W] d3d11 m0 s0 t=10s fps=60.0 consume=6.86 copyOutWC=2.79(5942MB/s) val=3.35 tot=9.65 max=19.8 mism=0 skip=0
+[W] d3d11 m0 s1 t=10s fps=60.2 consume=6.90 copyOutWC=2.84(5838MB/s) val=3.28 tot=9.75 max=19.2 mism=0 skip=0
+[W] d3d11 m0 s2 t=10s fps=60.2 consume=7.13 copyOutWC=2.85(5827MB/s) val=3.20 tot=9.98 max=25.2 mism=0 skip=0
+[W] d3d11 m0 s0 t=15s fps=60.0 consume=6.49 copyOutWC=2.52(6593MB/s) val=3.71 tot=9.01 max=16.2 mism=0 skip=0
+[W] d3d11 m0 s1 t=15s fps=60.0 consume=6.99 copyOutWC=2.86(5797MB/s) val=3.12 tot=9.85 max=21.1 mism=0 skip=0
+[W] d3d11 m0 s2 t=15s fps=60.0 consume=7.02 copyOutWC=2.73(6070MB/s) val=3.24 tot=9.75 max=18.5 mism=0 skip=0
+[W] d3d11 m0 s0 t=20s fps=60.4 consume=3.48 copyOutWC=1.07(6922MB/s) val=1.37 tot=4.55 max=14.4 mism=0 skip=0
+[W] d3d11 m0 s1 t=20s fps=60.2 consume=3.67 copyOutWC=1.09(6783MB/s) val=1.27 tot=4.76 max=12.2 mism=0 skip=0
+[W] d3d11 m0 s2 t=20s fps=60.2 consume=3.43 copyOutWC=1.05(7025MB/s) val=1.38 tot=4.48 max=13.1 mism=0 skip=0
+[W] d3d11 m0 s0 t=25s fps=56.4 consume=3.33 copyOutWC=0.95(7731MB/s) val=1.46 tot=4.28 max=11.6 mism=0 skip=0
+[W] d3d11 m0 s1 t=25s fps=56.6 consume=3.86 copyOutWC=1.06(6941MB/s) val=1.19 tot=4.92 max=13.4 mism=0 skip=0
+[W] d3d11 m0 s2 t=25s fps=56.6 consume=3.61 copyOutWC=1.03(7148MB/s) val=1.35 tot=4.64 max=12.7 mism=0 skip=0
+[W] d3d11 m0 s0 t=30s fps=60.0 consume=2.72 copyOutWC=0.80(9225MB/s) val=1.16 tot=3.53 max=17.8 mism=0 skip=0
+[W] d3d11 m0 s1 t=30s fps=59.8 consume=3.51 copyOutWC=0.92(8054MB/s) val=0.84 tot=4.42 max=9.9 mism=0 skip=0
+[W] d3d11 m0 s2 t=30s fps=59.8 consume=3.35 copyOutWC=0.91(8143MB/s) val=1.04 tot=4.25 max=10.5 mism=0 skip=0
+[W] d3d11 m0 s0 t=35s fps=60.0 consume=4.12 copyOutWC=1.74(9557MB/s) val=4.20 tot=5.86 max=37.2 mism=0 skip=1
+[W] d3d11 m0 s1 t=35s fps=60.2 consume=6.92 copyOutWC=2.64(6284MB/s) val=2.29 tot=9.56 max=42.2 mism=0 skip=1
+[W] d3d11 m0 s2 t=35s fps=60.2 consume=5.79 copyOutWC=2.65(6261MB/s) val=3.52 tot=8.44 max=41.4 mism=0 skip=1
+[W] d3d11 m0 s0 t=40s fps=60.2 consume=4.04 copyOutWC=1.80(9198MB/s) val=4.52 tot=5.85 max=13.7 mism=0 skip=1
+[W] d3d11 m0 s1 t=40s fps=60.2 consume=6.87 copyOutWC=2.96(5608MB/s) val=2.38 tot=9.82 max=17.8 mism=0 skip=1
+[W] d3d11 m0 s2 t=40s fps=60.2 consume=5.72 copyOutWC=2.82(5876MB/s) val=3.67 tot=8.54 max=16.3 mism=0 skip=1
+[W] d3d11 m0 s0 t=45s fps=60.2 consume=4.04 copyOutWC=1.85(8987MB/s) val=4.85 tot=5.89 max=14.1 mism=0 skip=1
+[W] d3d11 m0 s1 t=45s fps=60.0 consume=6.87 copyOutWC=3.01(5505MB/s) val=2.60 tot=9.89 max=20.8 mism=0 skip=1
+[W] d3d11 m0 s2 t=45s fps=60.2 consume=5.82 copyOutWC=2.92(5686MB/s) val=3.75 tot=8.73 max=17.3 mism=0 skip=1
+[PHASE-END] soak d3d11 m0 streams=3 wall=45.1s fps/stream=59.6 consumerCPU=1.11 cores (validate~0.48) producerCPU=0.13 processCPU=2.06
+
+[PHASE] rate variant=on12 mutex=1 streams=1 fps=0 secs=10 resize=0 stopstart=0
+[W] on12 m1 s0 t=5s fps=162.0 sched=2.04 convGpu=0.28 copyQ=1.16 copyOut=1.11(14997MB/s) val=1.48 tot=4.58 max=20.5 mism=0 skip=0
+[W] on12 m1 s0 t=10s fps=159.2 sched=2.06 convGpu=0.28 copyQ=1.15 copyOut=1.19(13947MB/s) val=1.59 tot=4.68 max=12.5 mism=0 skip=0
+[PHASE-END] rate on12 m1 streams=1 wall=10.0s fps/stream=160.9 consumerCPU=0.46 cores (validate~0.25) producerCPU=0.02 processCPU=0.50
+
+[PHASE] rate variant=on12 mutex=1 streams=2 fps=0 secs=10 resize=0 stopstart=0
+[W] on12 m1 s0 t=5s fps=121.2 sched=3.15 convGpu=0.29 copyQ=1.15 copyOut=1.64(10091MB/s) val=1.85 tot=6.24 max=32.9 mism=0 skip=0
+[W] on12 m1 s1 t=5s fps=121.4 sched=2.31 convGpu=0.26 copyQ=1.15 copyOut=1.48(11202MB/s) val=2.88 tot=5.20 max=22.9 mism=0 skip=0
+[W] on12 m1 s0 t=10s fps=133.4 sched=2.86 convGpu=0.28 copyQ=1.15 copyOut=1.46(11399MB/s) val=1.76 tot=5.74 max=13.7 mism=0 skip=0
+[W] on12 m1 s1 t=10s fps=133.6 sched=2.33 convGpu=0.26 copyQ=1.15 copyOut=1.31(12636MB/s) val=2.43 tot=5.05 max=13.2 mism=0 skip=0
+[PHASE-END] rate on12 m1 streams=2 wall=10.1s fps/stream=127.5 consumerCPU=1.06 cores (validate~0.56) producerCPU=0.03 processCPU=1.12
+
+[PHASE] rate variant=on12 mutex=1 streams=3 fps=0 secs=10 resize=0 stopstart=0
+[W] on12 m1 s0 t=5s fps=99.8 sched=3.08 convGpu=0.29 copyQ=1.16 copyOut=2.03(8177MB/s) val=3.22 tot=6.56 max=31.5 mism=0 skip=0
+[W] on12 m1 s1 t=5s fps=99.8 sched=2.94 convGpu=0.28 copyQ=1.17 copyOut=1.98(8369MB/s) val=3.41 tot=6.37 max=22.8 mism=0 skip=0
+[W] on12 m1 s2 t=5s fps=98.8 sched=3.30 convGpu=0.28 copyQ=1.17 copyOut=2.21(7509MB/s) val=2.91 tot=6.96 max=45.5 mism=0 skip=0
+[W] on12 m1 s0 t=10s fps=94.8 sched=3.10 convGpu=0.28 copyQ=1.18 copyOut=2.28(7272MB/s) val=3.72 tot=6.84 max=22.8 mism=0 skip=0
+[W] on12 m1 s1 t=10s fps=94.2 sched=3.37 convGpu=0.27 copyQ=1.19 copyOut=2.46(6735MB/s) val=3.33 tot=7.29 max=18.2 mism=0 skip=0
+[W] on12 m1 s2 t=10s fps=94.4 sched=3.03 convGpu=0.28 copyQ=1.18 copyOut=2.27(7299MB/s) val=3.83 tot=6.77 max=17.3 mism=0 skip=0
+[PHASE-END] rate on12 m1 streams=3 wall=10.1s fps/stream=97.1 consumerCPU=1.69 cores (validate~0.98) producerCPU=0.06 processCPU=1.81
+
+[PHASE] rate variant=d3d11 mutex=1 streams=1 fps=0 secs=10 resize=0 stopstart=0
+[W] d3d11 m1 s0 t=5s fps=152.2 consume=3.63 copyOutWC=1.31(12654MB/s) val=1.56 tot=4.94 max=22.4 mism=0 skip=0
+[W] d3d11 m1 s0 t=10s fps=165.6 consume=3.56 copyOutWC=1.12(14796MB/s) val=1.36 tot=4.68 max=15.7 mism=0 skip=0
+[PHASE-END] rate d3d11 m1 streams=1 wall=10.0s fps/stream=159.1 consumerCPU=0.66 cores (validate~0.23) producerCPU=0.03 processCPU=1.33
+
+[PHASE] rate variant=d3d11 mutex=1 streams=2 fps=0 secs=10 resize=0 stopstart=0
+[W] d3d11 m1 s0 t=5s fps=112.4 consume=4.43 copyOutWC=1.89(8792MB/s) val=2.44 tot=6.32 max=19.7 mism=0 skip=0
+[W] d3d11 m1 s1 t=5s fps=112.4 consume=4.22 copyOutWC=1.81(9184MB/s) val=2.74 tot=6.02 max=16.3 mism=0 skip=0
+[W] d3d11 m1 s0 t=10s fps=111.8 consume=4.42 copyOutWC=1.96(8480MB/s) val=2.57 tot=6.38 max=12.9 mism=0 skip=0
+[W] d3d11 m1 s1 t=10s fps=112.0 consume=4.27 copyOutWC=1.91(8690MB/s) val=2.77 tot=6.18 max=15.2 mism=0 skip=0
+[PHASE-END] rate d3d11 m1 streams=2 wall=10.1s fps/stream=112.4 consumerCPU=1.30 cores (validate~0.59) producerCPU=0.03 processCPU=2.28
+
+[PHASE] rate variant=d3d11 mutex=1 streams=3 fps=0 secs=10 resize=0 stopstart=0
+[W] d3d11 m1 s0 t=5s fps=85.0 consume=5.30 copyOutWC=2.34(7091MB/s) val=3.88 tot=7.64 max=19.8 mism=0 skip=0
+[W] d3d11 m1 s1 t=5s fps=85.2 consume=5.45 copyOutWC=2.47(6704MB/s) val=3.57 tot=7.93 max=21.1 mism=0 skip=0
+[W] d3d11 m1 s2 t=5s fps=85.0 consume=5.37 copyOutWC=2.36(7026MB/s) val=3.79 tot=7.73 max=21.9 mism=0 skip=0
+[W] d3d11 m1 s0 t=10s fps=82.4 consume=5.92 copyOutWC=2.41(6895MB/s) val=3.83 tot=8.32 max=19.4 mism=0 skip=0
+[W] d3d11 m1 s1 t=10s fps=82.0 consume=5.43 copyOutWC=2.30(7206MB/s) val=4.46 tot=7.73 max=19.6 mism=0 skip=0
+[W] d3d11 m1 s2 t=10s fps=82.8 consume=5.63 copyOutWC=2.31(7193MB/s) val=4.16 tot=7.93 max=18.0 mism=0 skip=0
+[PHASE-END] rate d3d11 m1 streams=3 wall=10.1s fps/stream=84.0 consumerCPU=1.97 cores (validate~0.99) producerCPU=0.03 processCPU=3.73
+
+==== GATE SUMMARY (paste this whole block) ====
+[GATE-A] mismatchFrames=0 framesValidated=45760 staleDetected=0 resizes=24 stopStarts=12  -> PASS (criterion: mismatchFrames == 0)
+[GATE-B] deviceRemoved=0 watchdogTimeouts=0 acquireFails=0 openFails=0 consumeErrors=0 producerErrors=0 drainTimeouts=0 configMismatch=0 fatals=0  -> PASS (criterion: all 0)
+[GATE-C] on12 (n=23185): open+convert(sched)=3.05ms convGpu=0.43ms copyQueue=1.13ms copyOut=2.03ms (7129 MB/s) total=6.65ms
+[GATE-C] d3d11 (n=22455): open+convert+WaitGpu(consume)=5.51ms copyOutWC=2.16ms (6670 MB/s) total=7.67ms
+[GATE-C] copy-out WC->cached ratio: 1.1x (hypothesis: cached-memcpy class; measured, no target)
+[GATE-C2] on12 isolated consume rate (unthrottled, validate on): 1stream=160.9fps/stream (consCPU=0.46 cores, validate~0.25) 2stream=127.5fps/stream (consCPU=1.06 cores, validate~0.56) 3stream=97.1fps/stream (consCPU=1.69 cores, validate~0.98)
+[GATE-C2] d3d11 isolated consume rate (unthrottled, validate on): 1stream=159.1fps/stream (consCPU=0.66 cores, validate~0.23) 2stream=112.4fps/stream (consCPU=1.30 cores, validate~0.59) 3stream=84.0fps/stream (consCPU=1.97 cores, validate~0.99)
+[GATE-D] teardown clean=YES (wrapped released before final Flush, fences drained, devices freed, NT handles closed)
+RESULT: PASS
