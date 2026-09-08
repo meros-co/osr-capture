@@ -313,7 +313,9 @@ Texture2D<float4> gVideo : register(t1);
 float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
     uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
     uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
-    if (gVideoFormat != 1) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    // 0 = BGRA (the texture's own order), 3 = RGBA (red and blue arrive swapped), 1 = UYVY below
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
     float4 s = gVideo.Load(int3(vx / 2, vy, 0));
     float luma = ((vx & 1) == 0) ? s.g : s.a;
     float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
@@ -476,7 +478,9 @@ Texture2D<float4> gVideo : register(t1);
 float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
     uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
     uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
-    if (gVideoFormat != 1) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    // 0 = BGRA (the texture's own order), 3 = RGBA (red and blue arrive swapped), 1 = UYVY below
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
     float4 s = gVideo.Load(int3(vx / 2, vy, 0));
     float luma = ((vx & 1) == 0) ? s.g : s.a;
     float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
@@ -560,7 +564,9 @@ Texture2D<float4> gVideo : register(t1);
 float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
     uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
     uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
-    if (gVideoFormat != 1) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    // 0 = BGRA (the texture's own order), 3 = RGBA (red and blue arrive swapped), 1 = UYVY below
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
     float4 s = gVideo.Load(int3(vx / 2, vy, 0));
     float luma = ((vx & 1) == 0) ? s.g : s.a;
     float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
@@ -1153,7 +1159,7 @@ struct ReadbackContext {
     bool SetVideoLayer(const osrcap::VideoLayer& video, std::string& err) {
         videoOn = false;
         if (!video.w || !video.h || !video.data) return true;
-        const uint32_t texels = video.format == 1 ? video.w / 2 : video.w;
+        const uint32_t texels = video.format == 1 ? video.w / 2 : video.w;  // UYVY packs two pixels per texel
         const uint32_t rowBytes = texels * 4;
         if ((size_t)rowBytes * video.h > video.bytes) { err = "video layer buffer too small"; return false; }
 

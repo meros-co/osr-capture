@@ -34,7 +34,7 @@ bool TargetsSupported();
 
 // A video frame composited UNDER the captured page in the same pass, so live input never has to travel
 // through the browser's GPU thread to reach the output. `data` is the caller's buffer, read during the
-// consume call only. format: 0 = BGRA, 1 = UYVY. An empty layer (w == 0) composites nothing.
+// consume call only. format: 0 = BGRA, 1 = UYVY, 3 = RGBA. An empty layer (w == 0) composites nothing.
 struct VideoLayer {
     const uint8_t* data = nullptr;
     size_t bytes = 0;
