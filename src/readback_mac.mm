@@ -555,6 +555,12 @@ const char* ReadbackBackend() {
 namespace osrcap {
 // Per-consumer targets are not produced by the Metal path yet: the caller downscales/converts on the CPU.
 bool TargetsSupported() { return false; }
+// The video layer is composited by the Windows path only; elsewhere the page draws the frame as before.
+bool VideoLayerSupported() { return false; }
+bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
+    if (video.w) { err = "a video layer is not supported by the macOS backend"; return false; }
+    return ReadbackConsume(handle, width, height, format, key, dstW, dstH, targets, err);
+}
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
     if (!targets.empty()) { err = "per-consumer targets are not supported by the macOS backend"; return false; }
     return ReadbackConsume(handle, width, height, format, key, dstW, dstH, err);

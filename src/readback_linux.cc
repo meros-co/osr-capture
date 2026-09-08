@@ -193,4 +193,6 @@ bool ReadbackOnce(const std::vector<DmabufPlane>& planes, uint64_t modifier, uin
 namespace osrcap {
 // Per-consumer targets are not produced by the GLES path yet: the caller downscales/converts on the CPU.
 bool TargetsSupported() { return false; }
+// The video layer is composited by the Windows path only; elsewhere the page draws the frame as before.
+bool VideoLayerSupported() { return false; }
 }  // namespace osrcap

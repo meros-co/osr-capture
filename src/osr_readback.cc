@@ -215,8 +215,11 @@ std::vector<osrcap::TargetSpec> ParseTargets(const Napi::CallbackInfo& info, siz
 class ConsumeWorker : public Napi::AsyncWorker {
 public:
 #if defined(_WIN32) || defined(__APPLE__)
-    ConsumeWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred)
-        : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred) {}
+    ConsumeWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred, const osrcap::VideoLayer& video = osrcap::VideoLayer(), Napi::Value videoData = Napi::Value())
+        : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred), video_(video) {
+        // the caller's video buffer is read on the worker thread: keep it alive for the call
+        if (!videoData.IsEmpty() && videoData.IsBuffer()) videoRef_ = Napi::Persistent(videoData.As<Napi::Object>());
+    }
 #elif defined(__linux__)
     ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred)
         : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred) {}
@@ -224,7 +227,8 @@ public:
     void Execute() override {
         std::string err;
 #if defined(_WIN32) || defined(__APPLE__)
-        bool ok = osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
+        bool ok = video_.w ? osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
+                           : osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #elif defined(__linux__)
         bool ok = targets_.empty() ? osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, err) : false;
         if (!targets_.empty()) err = "per-consumer targets are not supported by the Linux backend";
@@ -238,6 +242,8 @@ public:
     void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
 
 private:
+    osrcap::VideoLayer video_;
+    Napi::ObjectReference videoRef_;
 #if defined(_WIN32) || defined(__APPLE__)
     uintptr_t handle_;
 #elif defined(__linux__)
@@ -460,7 +466,22 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
     uintptr_t handle = 0;
     Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
     if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
-    (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred))->Queue();
+    // consume(..., targets, video): `video` = { width, height, format, data } composited under the page
+    osrcap::VideoLayer video;
+    Napi::Value videoData;
+    if (info.Length() > 8 && info[8].IsObject()) {
+        Napi::Object v = info[8].As<Napi::Object>();
+        if (v.Get("data").IsBuffer()) {
+            videoData = v.Get("data");
+            Napi::Buffer<uint8_t> vb = videoData.As<Napi::Buffer<uint8_t>>();
+            video.data = vb.Data();
+            video.bytes = vb.ByteLength();
+            video.w = v.Get("width").As<Napi::Number>().Uint32Value();
+            video.h = v.Get("height").As<Napi::Number>().Uint32Value();
+            video.format = v.Has("format") ? v.Get("format").As<Napi::Number>().Int32Value() : 0;
+        }
+    }
+    (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred, video, videoData))->Queue();
 #elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes;
     uint64_t modifier = 0;
@@ -615,6 +636,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
     exports.Set("targetsSupported", Napi::Boolean::New(env, osrcap::TargetsSupported()));
+    exports.Set("videoLayerSupported", Napi::Boolean::New(env, osrcap::VideoLayerSupported()));
 #endif
 #if defined(_WIN32)
     exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));

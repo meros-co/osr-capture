@@ -32,6 +32,19 @@ inline size_t TargetBytes(const TargetSpec& t) {
 // Whether this platform's GPU backend produces TargetSpec outputs (Windows D3D11 today).
 bool TargetsSupported();
 
+// A video frame composited UNDER the captured page in the same pass, so live input never has to travel
+// through the browser's GPU thread to reach the output. `data` is the caller's buffer, read during the
+// consume call only. format: 0 = BGRA, 1 = UYVY. An empty layer (w == 0) composites nothing.
+struct VideoLayer {
+    const uint8_t* data = nullptr;
+    size_t bytes = 0;
+    uint32_t w = 0;
+    uint32_t h = 0;
+    int format = 0;
+};
+// Whether this platform's GPU backend composites a VideoLayer (Windows D3D11 today).
+bool VideoLayerSupported();
+
 // format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (colour + alpha), 3 = RGBA (swizzle). All three
 // platforms convert on the GPU — Windows HLSL compute, macOS Metal compute, Linux GLES3 shader — and each
 // falls back to the CPU converter only when its GPU path is unavailable for the device or the frame.
@@ -61,6 +74,8 @@ bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int form
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err);
 // Same, with per-consumer targets (see TargetSpec). `targetDsts` must have one entry per target given to consume.
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err);
+// Same, compositing `video` under the page (see VideoLayer).
+bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err);
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err);
 void ReadbackReleaseKey(const std::string& key);  // drop any pending consume for `key` (cleanup)
 
