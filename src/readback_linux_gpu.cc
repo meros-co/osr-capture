@@ -99,6 +99,8 @@ constexpr uint32_t kFourccXrgb8888 = Fourcc('X', 'R', '2', '4');
 constexpr uint64_t kModifierInvalid = 0x00ffffffffffffffULL;  // DRM_FORMAT_MOD_INVALID
 
 constexpr GLuint64 kFenceTimeoutNs = 2000000000ULL;  // 2s watchdog, matches the Windows fence watchdogs
+constexpr long long kDemotionBaseMs = 1000;          // first backoff; doubles per successive demotion
+constexpr long long kDemotionMaxMs = 60000;          // ceiling, so even a broken GPU still re-probes
 constexpr int kImportFailDemotion = 3;               // consecutive import failures before demoting to CPU
 
 bool HasToken(const char* list, const char* token) {
@@ -340,7 +342,17 @@ public:
     void ReleaseKeyOnThread(const std::string& key);
 
     std::atomic<int> importFails{0};
-    std::atomic<bool> demoted{false};
+    // A demotion is a timed backoff, never permanent: an import failure can be transient (a GPU reset,
+    // a driver reload), and a permanent flag meant one bad moment cost CPU conversion of every frame for
+    // the life of the process. Each successive demotion doubles the wait, so a genuinely broken GPU
+    // settles into probing rarely instead of once per frame.
+    std::atomic<long long> demotedUntilMs{0};
+    std::atomic<int> demotions{0};
+
+    static long long NowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    bool Demoted() const { return NowMs() < demotedUntilMs.load(); }
 
 private:
     void ThreadMain() {
@@ -958,19 +970,19 @@ bool Init() {
     GlThread& t = GlThread::Instance();
     bool ok = t.EnsureInit();
     LogBackendOnce(t, ok);
-    return ok && !t.demoted.load();
+    return ok && !t.Demoted();
 }
 
 bool Initialized() { return GlThread::Instance().InitOk(); }
 
 bool Available() {
     GlThread& t = GlThread::Instance();
-    return t.InitOk() && !t.demoted.load();
+    return t.InitOk() && !t.Demoted();
 }
 
 const char* BackendName() {
     GlThread& t = GlThread::Instance();
-    if (t.InitOk()) return t.demoted.load() ? "cpu" : "egl-gles3";
+    if (t.InitOk()) return t.Demoted() ? "cpu" : "egl-gles3";
     return g_loggedBackend.load() ? "cpu" : "none";
 }
 
@@ -978,7 +990,7 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
              int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err, bool& importFailed) {
     importFailed = false;
     GlThread& t = GlThread::Instance();
-    if (!t.InitOk() || t.demoted.load()) {
+    if (!t.InitOk() || t.Demoted()) {
         err = "linux gpu readback unavailable";
         return false;
     }
@@ -991,19 +1003,25 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
     MaybeLogDiag(t);
     if (ok) {
         t.importFails.store(0);
+        t.demotions.store(0);
         return true;
     }
     D().consumeFails.fetch_add(1);
     err = e;
     importFailed = impFail;
-    // Demote for good after repeated import failures (e.g. WSL's virtual GPU): stop burning a GPU
-    // round-trip per frame; callers switch to the CPU path via Available().
+    // Back off after repeated import failures (e.g. WSL's virtual GPU): stop burning a GPU
+    // round-trip per frame; callers take the CPU path via Available() until the deadline passes.
     if (impFail && t.importFails.fetch_add(1) + 1 >= kImportFailDemotion) {
-        t.demoted.store(true);
+        t.importFails.store(0);
+        const int n = t.demotions.fetch_add(1) + 1;
+        long long waitMs = kDemotionBaseMs;
+        for (int i = 1; i < n && waitMs < kDemotionMaxMs; ++i) waitMs *= 2;
+        if (waitMs > kDemotionMaxMs) waitMs = kDemotionMaxMs;
+        t.demotedUntilMs.store(GlThread::NowMs() + waitMs);
         bool expected = false;
         if (g_loggedDemotion.compare_exchange_strong(expected, true)) {
-            std::fprintf(stderr, "[osr-capture] linux gpu readback demoted to cpu after %d import failures (%s)\n",
-                         kImportFailDemotion, e.c_str());
+            std::fprintf(stderr, "[osr-capture] linux gpu readback on cpu for %lldms after %d import failures (%s)\n",
+                         waitMs, kImportFailDemotion, e.c_str());
         }
     }
     return false;
