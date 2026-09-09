@@ -137,6 +137,9 @@ bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, 
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err);
 // ... and with per-consumer targets, produced in the same GPU pass (see TargetSpec above).
 bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err);
+// ... and compositing `video` under the page (see VideoLayer). GPU path only: the CPU fallback cannot
+// composite, so a frame it would have to take fails instead of returning a picture with no video in it.
+bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err);
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err);
 void ReadbackReleaseKey(const std::string& key);  // drop pending state + cached GL resources for `key`
 

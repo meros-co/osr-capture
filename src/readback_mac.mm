@@ -43,14 +43,46 @@ using namespace metal;
 
 inline int toByte(float v) { return int(v * 255.0f + 0.5f); }
 
-struct ConvParams { uint width; uint height; uint uyvySize; uint writeAlpha; };
-struct DsParams   { uint srcW; uint srcH; uint dstW; uint dstH; };
-struct SwParams   { uint width; uint height; };
+// The video layer sits under the page: where the page is transparent, its pixels show through. Ported from
+// the Windows videoAt/overVideo (readback_win.cc) so a composited frame matches one drawn in the page.
+struct VidParams { uint on; uint w; uint h; uint format; };
+
+struct ConvParams { uint width; uint height; uint uyvySize; uint writeAlpha; VidParams vid; };
+struct DsParams   { uint srcW; uint srcH; uint dstW; uint dstH; VidParams vid; };
+struct SwParams   { uint width; uint height; VidParams vid; };
+
+// The layer texture is created BGRA8Unorm (see UploadVideoLayer), so byte 0 arrives as .b, byte 1 as .g,
+// byte 2 as .r and byte 3 as .a — the exact mapping the Windows decode relies on, so both are line-for-line
+// identical. Layer format 0 is B,G,R,A in memory (-> .rgb), 3 is R,G,B,A (-> .bgr), 1 is U,Y0,V,Y1.
+inline float3 videoAt(texture2d<float, access::read> vid, constant VidParams& vp,
+                      uint x, uint y, uint dstW, uint dstH) {
+    uint vx = (dstW == vp.w) ? x : x * vp.w / dstW;
+    uint vy = (dstH == vp.h) ? y : y * vp.h / dstH;
+    if (vp.format == 0) return vid.read(uint2(vx, vy)).rgb;
+    if (vp.format == 3) return vid.read(uint2(vx, vy)).bgr;
+    float4 s = vid.read(uint2(vx / 2, vy));  // UYVY: one texel holds the pixel pair
+    float luma = ((vx & 1) == 0) ? s.g : s.a;
+    float yy = (luma - 16.0f / 255.0f) * (255.0f / 219.0f);
+    float u = (s.b - 128.0f / 255.0f) * (255.0f / 224.0f);
+    float v = (s.r - 128.0f / 255.0f) * (255.0f / 224.0f);
+    float bt = (vp.h >= 720) ? 1.0f : 0.0f;  // BT.709 at HD and above, BT.601 below
+    float kr = mix(1.402f, 1.5748f, bt), kb = mix(1.772f, 1.8556f, bt);
+    float gu = mix(0.344136f, 0.1873f, bt), gv = mix(0.714136f, 0.4681f, bt);
+    return saturate(float3(yy + kr * v, yy - gu * u - gv * v, yy + kb * u));
+}
+// page over video, premultiplied: opaque page pixels are untouched, and with no layer this is one branch
+inline float4 overVideo(float4 page, texture2d<float, access::read> vid, constant VidParams& vp,
+                        uint x, uint y, uint dstW, uint dstH) {
+    if (vp.on == 0) return page;
+    if (page.a >= 0.999f) return page;
+    return float4(page.rgb + videoAt(vid, vp, x, y, dstW, dstH) * (1.0f - page.a), 1.0f);
+}
 
 // BGRA -> UYVY (+ optional full-res alpha plane). Each thread handles 4 horizontal pixels so every store to
 // the output buffer is a 4-byte-aligned word (2 UYVY words + 1 packed-alpha word), matching the Windows
 // RWByteAddressBuffer stores. Callers guarantee width % 4 == 0, so px+3 is always inside the row.
 kernel void convertUyvy(texture2d<float, access::read> src [[texture(0)]],
+                        texture2d<float, access::read> vid [[texture(1)]],
                         device uint* dst [[buffer(0)]],
                         constant ConvParams& p [[buffer(1)]],
                         uint2 tid [[thread_position_in_grid]]) {
@@ -58,10 +90,10 @@ kernel void convertUyvy(texture2d<float, access::read> src [[texture(0)]],
     uint y = tid.y;
     if (px >= p.width || y >= p.height) return;
 
-    float4 c0 = src.read(uint2(px + 0, y));
-    float4 c1 = src.read(uint2(px + 1, y));
-    float4 c2 = src.read(uint2(px + 2, y));
-    float4 c3 = src.read(uint2(px + 3, y));
+    float4 c0 = overVideo(src.read(uint2(px + 0, y)), vid, p.vid, px + 0, y, p.width, p.height);
+    float4 c1 = overVideo(src.read(uint2(px + 1, y)), vid, p.vid, px + 1, y, p.width, p.height);
+    float4 c2 = overVideo(src.read(uint2(px + 2, y)), vid, p.vid, px + 2, y, p.width, p.height);
+    float4 c3 = overVideo(src.read(uint2(px + 3, y)), vid, p.vid, px + 3, y, p.width, p.height);
 
     int r0 = toByte(c0.r), g0 = toByte(c0.g), b0 = toByte(c0.b);
     int r1 = toByte(c1.r), g1 = toByte(c1.g), b1 = toByte(c1.b);
@@ -96,6 +128,7 @@ kernel void convertUyvy(texture2d<float, access::read> src [[texture(0)]],
 // channel. That is the pre-existing convention on all three GPU backends, kept here deliberately so the
 // three GPU paths agree with each other; the convert kernels above ARE byte-identical to the CPU converter.
 kernel void downscaleBgra(texture2d<float, access::read> src [[texture(0)]],
+                          texture2d<float, access::read> vid [[texture(1)]],
                           device uint* dst [[buffer(0)]],
                           constant DsParams& p [[buffer(1)]],
                           uint2 tid [[thread_position_in_grid]]) {
@@ -112,7 +145,7 @@ kernel void downscaleBgra(texture2d<float, access::read> src [[texture(0)]],
     for (uint y = sy0; y < sy1; ++y) {
         for (uint x = sx0; x < sx1; ++x) { acc += src.read(uint2(x, y)); ++cnt; }
     }
-    acc /= float(cnt);
+    acc = overVideo(acc / float(cnt), vid, p.vid, tid.x, tid.y, p.dstW, p.dstH);
     uint word = uint(toByte(acc.b)) | (uint(toByte(acc.g)) << 8) | (uint(toByte(acc.r)) << 16) | (uint(toByte(acc.a)) << 24);
     dst[tid.y * p.dstW + tid.x] = word;  // B,G,R,A byte order
 }
@@ -120,11 +153,12 @@ kernel void downscaleBgra(texture2d<float, access::read> src [[texture(0)]],
 // BGRA -> RGBA channel swap (WebRTC's ImageData is RGBA). Same size as the source; the swizzle is free
 // relative to the copy it rides along with.
 kernel void swizzleRgba(texture2d<float, access::read> src [[texture(0)]],
+                        texture2d<float, access::read> vid [[texture(1)]],
                         device uint* dst [[buffer(0)]],
                         constant SwParams& p [[buffer(1)]],
                         uint2 tid [[thread_position_in_grid]]) {
     if (tid.x >= p.width || tid.y >= p.height) return;
-    float4 c = src.read(uint2(tid.x, tid.y));
+    float4 c = overVideo(src.read(uint2(tid.x, tid.y)), vid, p.vid, tid.x, tid.y, p.width, p.height);
     uint word = uint(toByte(c.r)) | (uint(toByte(c.g)) << 8) | (uint(toByte(c.b)) << 16) | (uint(toByte(c.a)) << 24);
     dst[tid.y * p.width + tid.x] = word;  // R,G,B,A byte order
 }
@@ -134,10 +168,13 @@ kernel void swizzleRgba(texture2d<float, access::read> src [[texture(0)]],
 // 1:1 from the Windows kScaleConvertHLSL / kScaleI420HLSL so all three backends emit the same bytes. Without
 // these every target was derived on a CPU thread (box downscale + colour convert per consumer per frame),
 // which also forced the main readback to stay uncompressed BGRA.
-struct ScParams { uint srcW; uint srcH; uint dstW; uint dstH; uint format; uint uyvySize; };
+struct ScParams { uint srcW; uint srcH; uint dstW; uint dstH; uint format; uint uyvySize; VidParams vid; };
 
-inline float4 boxAvg(texture2d<float, access::read> src, constant ScParams& p, uint dx, uint dy) {
-    if (p.srcW == p.dstW && p.srcH == p.dstH) return src.read(uint2(dx, dy));
+// The composite lives INSIDE boxAvg (as it does in the Windows kScaleI420HLSL), so both target kernels get
+// it from one place and no call site can double-apply it.
+inline float4 boxAvg(texture2d<float, access::read> src, texture2d<float, access::read> vid,
+                     constant ScParams& p, uint dx, uint dy) {
+    if (p.srcW == p.dstW && p.srcH == p.dstH) return overVideo(src.read(uint2(dx, dy)), vid, p.vid, dx, dy, p.dstW, p.dstH);
     uint sx0 = dx * p.srcW / p.dstW;
     uint sx1 = (dx + 1) * p.srcW / p.dstW; if (sx1 <= sx0) sx1 = sx0 + 1;
     uint sy0 = dy * p.srcH / p.dstH;
@@ -149,20 +186,21 @@ inline float4 boxAvg(texture2d<float, access::read> src, constant ScParams& p, u
     for (uint y = sy0; y < sy1; ++y) {
         for (uint x = sx0; x < sx1; ++x) { acc += src.read(uint2(x, y)); ++cnt; }
     }
-    return acc / float(cnt);
+    return overVideo(acc / float(cnt), vid, p.vid, dx, dy, p.dstW, p.dstH);
 }
 
 // formats 0 (BGRA), 1 (UYVY), 2 (UYVA), 3 (RGBA). Two destination pixels per thread, as on Windows, so the
 // UYVY store is one aligned word.
 kernel void scaleConvert(texture2d<float, access::read> src [[texture(0)]],
+                         texture2d<float, access::read> vid [[texture(1)]],
                          device uint* dst [[buffer(0)]],
                          constant ScParams& p [[buffer(1)]],
                          uint2 tid [[thread_position_in_grid]]) {
     uint px = tid.x * 2;
     uint y = tid.y;
     if (px >= p.dstW || y >= p.dstH) return;
-    float4 c0 = boxAvg(src, p, px, y);
-    float4 c1 = (px + 1 < p.dstW) ? boxAvg(src, p, px + 1, y) : c0;
+    float4 c0 = boxAvg(src, vid, p, px, y);
+    float4 c1 = (px + 1 < p.dstW) ? boxAvg(src, vid, p, px + 1, y) : c0;
 
     if (p.format == 0 || p.format == 3) {
         bool rgba = (p.format == 3);
@@ -186,8 +224,8 @@ kernel void scaleConvert(texture2d<float, access::read> src [[texture(0)]],
     dst[(y * p.dstW * 2 + px * 2) >> 2] = uint(u) | (uint(y0) << 8) | (uint(v) << 16) | (uint(y1) << 24);
 
     if (p.format == 2 && (px & 3) == 0) {
-        float4 c2 = (px + 2 < p.dstW) ? boxAvg(src, p, px + 2, y) : c1;
-        float4 c3 = (px + 3 < p.dstW) ? boxAvg(src, p, px + 3, y) : c2;
+        float4 c2 = (px + 2 < p.dstW) ? boxAvg(src, vid, p, px + 2, y) : c1;
+        float4 c3 = (px + 3 < p.dstW) ? boxAvg(src, vid, p, px + 3, y) : c2;
         uint aword = uint(toByte(c0.a)) | (uint(toByte(c1.a)) << 8) | (uint(toByte(c2.a)) << 16) | (uint(toByte(c3.a)) << 24);
         dst[(p.uyvySize + y * p.dstW + px) >> 2] = aword;
     }
@@ -200,6 +238,7 @@ inline uint lumaOf(float4 c) {
 
 // format 4: planar I420 for the RTMP encoder. 8x2 destination pixels per thread, matching SCI420Main.
 kernel void scaleI420(texture2d<float, access::read> src [[texture(0)]],
+                      texture2d<float, access::read> vid [[texture(1)]],
                       device uint* dst [[buffer(0)]],
                       constant ScParams& p [[buffer(1)]],
                       uint2 tid [[thread_position_in_grid]]) {
@@ -214,7 +253,7 @@ kernel void scaleI420(texture2d<float, access::read> src [[texture(0)]],
         for (uint i = 0; i < 8; ++i) {
             uint dx = min(bx + i, p.dstW - 1);
             uint dy = min(by + r, p.dstH - 1);
-            c[r * 8 + i] = boxAvg(src, p, dx, dy);
+            c[r * 8 + i] = boxAvg(src, vid, p, dx, dy);
         }
     }
     for (uint r2 = 0; r2 < 2; ++r2) {
@@ -246,21 +285,31 @@ kernel void scaleI420(texture2d<float, access::read> src [[texture(0)]],
 }
 )MSL";
 
+// Mirrors of the MSL structs above; the trailing VidParams must stay last in both.
+struct VidParams {
+    uint32_t on;
+    uint32_t w;
+    uint32_t h;
+    uint32_t format;
+};
 struct ConvParams {
     uint32_t width;
     uint32_t height;
     uint32_t uyvySize;
     uint32_t writeAlpha;
+    VidParams vid;
 };
 struct DsParams {
     uint32_t srcW;
     uint32_t srcH;
     uint32_t dstW;
     uint32_t dstH;
+    VidParams vid;
 };
 struct SwParams {
     uint32_t width;
     uint32_t height;
+    VidParams vid;
 };
 struct ScParams {
     uint32_t srcW;
@@ -269,6 +318,7 @@ struct ScParams {
     uint32_t dstH;
     uint32_t format;
     uint32_t uyvySize;
+    VidParams vid;
 };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -283,6 +333,9 @@ struct MetalCtx {
     id<MTLComputePipelineState> psoSwizzle = nil;
     id<MTLComputePipelineState> psoScaleConvert = nil;
     id<MTLComputePipelineState> psoScaleI420 = nil;
+    // Bound at texture(1) whenever a pass has no video layer, so the slot is always valid (the kernels
+    // never read it in that case — overVideo returns before the load).
+    id<MTLTexture> dummyVideo = nil;
     MTLStorageMode ioSurfaceStorage = MTLStorageModeManaged;
     bool ok = false;
 };
@@ -324,15 +377,22 @@ MetalCtx& Ctx() {
             ctx.psoSwizzle = pso("swizzleRgba");
             ctx.psoScaleConvert = pso("scaleConvert");
             ctx.psoScaleI420 = pso("scaleI420");
-            if (!ctx.queue || !ctx.psoConvert || !ctx.psoDownscale || !ctx.psoSwizzle || !ctx.psoScaleConvert || !ctx.psoScaleI420) {
+            // An IOSurface-backed texture must use Shared storage on unified-memory (Apple Silicon) devices
+            // and Managed on discrete/Intel ones. The same rule applies to the CPU-written video layer.
+            ctx.ioSurfaceStorage = ctx.device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
+            MTLTextureDescriptor* dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                          width:1
+                                                                                         height:1
+                                                                                      mipmapped:NO];
+            dd.usage = MTLTextureUsageShaderRead;
+            dd.storageMode = ctx.ioSurfaceStorage;
+            ctx.dummyVideo = [ctx.device newTextureWithDescriptor:dd];
+            if (!ctx.queue || !ctx.psoConvert || !ctx.psoDownscale || !ctx.psoSwizzle || !ctx.psoScaleConvert || !ctx.psoScaleI420 || !ctx.dummyVideo) {
                 g_backend = "iosurface-cpu";
                 fprintf(stderr, "[READBACK] Metal pipeline init failed -> CPU IOSurface path\n");
                 fflush(stderr);
                 return;
             }
-            // An IOSurface-backed texture must use Shared storage on unified-memory (Apple Silicon) devices
-            // and Managed on discrete/Intel ones.
-            ctx.ioSurfaceStorage = ctx.device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
             ctx.ok = true;
             g_backend = "metal";
             fprintf(stderr, "[READBACK] backend=metal (%s, %s memory)\n", [[ctx.device name] UTF8String],
@@ -371,6 +431,70 @@ id<MTLTexture> WrapSurface(IOSurfaceRef surface, uint32_t width, uint32_t height
     return [ctx.device newTextureWithDescriptor:desc iosurface:surface plane:0];
 }
 
+// One frame of the video layer, uploaded to a texture this backend owns. Kept PER KEY rather than per
+// context: the MetalCtx is a process-wide singleton that every output's worker thread shares, so a single
+// texture there would race between concurrent consumes; a key has at most one consume in flight.
+struct VideoTex {
+    id<MTLTexture> tex = nil;
+    uint32_t texW = 0;  // texture dimensions (half the layer width for UYVY)
+    uint32_t texH = 0;
+    bool on = false;    // a layer was uploaded for THIS frame
+    uint32_t w = 0;
+    uint32_t h = 0;
+    int format = 0;
+};
+
+// Upload one video frame on the CALLING thread, so live input reaches the output without passing through the
+// browser's GPU thread. BGRA8Unorm is deliberate: it makes byte 0 read as .b, byte 1 .g, byte 2 .r, byte 3 .a
+// in the shader, which is exactly what videoAt's decode (and the Windows one) expects for all three formats.
+bool UploadVideoLayer(const VideoLayer& video, VideoTex& vt, std::string& err) {
+    vt.on = false;
+    if (!video.w || !video.h || !video.data) return true;
+    const uint32_t texels = video.format == 1 ? video.w / 2 : video.w;  // UYVY packs two pixels per texel
+    const uint32_t rowBytes = texels * 4;
+    if (!texels || static_cast<size_t>(rowBytes) * video.h > video.bytes) {
+        err = "video layer buffer too small";
+        return false;
+    }
+
+    MetalCtx& ctx = Ctx();
+    if (!vt.tex || vt.texW != texels || vt.texH != video.h) {
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                        width:texels
+                                                                                       height:video.h
+                                                                                    mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = ctx.ioSurfaceStorage;
+        vt.tex = [ctx.device newTextureWithDescriptor:desc];
+        if (!vt.tex) {
+            vt.texW = vt.texH = 0;
+            err = "video texture creation failed";
+            return false;
+        }
+        vt.texW = texels;
+        vt.texH = video.h;
+    }
+
+    [vt.tex replaceRegion:MTLRegionMake2D(0, 0, texels, video.h)
+              mipmapLevel:0
+                withBytes:video.data
+              bytesPerRow:rowBytes];
+    vt.on = true;
+    vt.w = video.w;
+    vt.h = video.h;
+    vt.format = video.format;
+    return true;
+}
+
+// The params block every kernel carries, and the texture to bind at slot 1.
+VidParams VidOf(const VideoTex& vt) {
+    if (!vt.on || !vt.tex) return VidParams{0, 0, 0, 0};
+    return VidParams{1, vt.w, vt.h, static_cast<uint32_t>(vt.format)};
+}
+id<MTLTexture> VidTexOf(const VideoTex& vt) {
+    return (vt.on && vt.tex) ? vt.tex : Ctx().dummyVideo;
+}
+
 // Reused GPU output buffers, keyed the way the caller keys its N-API buffer pool (FreeShow passes the output
 // id, plus a slot suffix for pipelined captures). Avoids a per-frame MTLBuffer allocation. Guarded by g_mutex.
 struct KeyBufs {
@@ -389,6 +513,7 @@ struct KeyBufs {
     std::vector<id<MTLBuffer>> targets;
     std::vector<size_t> targetSizes;
     std::vector<std::vector<uint8_t>> cpuTargets;
+    VideoTex vtex;  // this output's video layer texture, reused across frames
 };
 
 std::mutex g_mutex;
@@ -408,8 +533,10 @@ id<MTLBuffer> EnsureBuffer(id<MTLBuffer> existing, size_t& existingSize, size_t 
 // MTLBuffers. This is the whole "consume" phase — see the two-phase contract in osr_readback.h.
 bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH,
             id<MTLBuffer> mainBuf, id<MTLBuffer> scaledBuf, const std::vector<TargetSpec>& targets,
-            const std::vector<id<MTLBuffer>>& targetBufs, std::string& err) {
+            const std::vector<id<MTLBuffer>>& targetBufs, const VideoTex& vtex, std::string& err) {
     MetalCtx& ctx = Ctx();
+    const VidParams vid = VidOf(vtex);
+    id<MTLTexture> vidTex = VidTexOf(vtex);
     @autoreleasepool {
         id<MTLTexture> tex = WrapSurface(surface, width, height);
         if (!tex) {
@@ -424,20 +551,22 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
         }
 
         if (format == 1 || format == 2) {
-            ConvParams p{width, height, static_cast<uint32_t>(width) * 2 * height, format == 2 ? 1u : 0u};
+            ConvParams p{width, height, static_cast<uint32_t>(width) * 2 * height, format == 2 ? 1u : 0u, vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:ctx.psoConvert];
             [enc setTexture:tex atIndex:0];
+            [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:mainBuf offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
             [enc dispatchThreads:MTLSizeMake((width + 3) / 4, height, 1)
                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
             [enc endEncoding];
         } else if (format == 3) {
-            SwParams p{width, height};
+            SwParams p{width, height, vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:ctx.psoSwizzle];
             [enc setTexture:tex atIndex:0];
+            [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:mainBuf offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
             [enc dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
@@ -459,10 +588,11 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
         }
 
         if (scaledBuf && dstW > 0 && dstH > 0) {
-            DsParams p{width, height, dstW, dstH};
+            DsParams p{width, height, dstW, dstH, vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:ctx.psoDownscale];
             [enc setTexture:tex atIndex:0];
+            [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:scaledBuf offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
             [enc dispatchThreads:MTLSizeMake(dstW, dstH, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
@@ -474,11 +604,12 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
         for (size_t i = 0; i < targets.size() && i < targetBufs.size(); ++i) {
             const TargetSpec& t = targets[i];
             if (!t.w || !t.h || !targetBufs[i]) continue;
-            ScParams p{width, height, t.w, t.h, static_cast<uint32_t>(t.format), t.w * 2 * t.h};
+            ScParams p{width, height, t.w, t.h, static_cast<uint32_t>(t.format), t.w * 2 * t.h, vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             const bool i420 = (t.format == 4);
             [enc setComputePipelineState:(i420 ? ctx.psoScaleI420 : ctx.psoScaleConvert)];
             [enc setTexture:tex atIndex:0];
+            [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:targetBufs[i] offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
             const NSUInteger gx = i420 ? (t.w + 7) / 8 : (t.w + 1) / 2;
@@ -541,7 +672,8 @@ bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int forma
             err = "failed to allocate Metal output buffer";
             return false;
         }
-        if (!RunGpu(surface, width, height, format, 0, 0, buf, nil, err)) return false;
+        VideoTex noVideo;  // no layer on the single-shot paths
+        if (!RunGpu(surface, width, height, format, 0, 0, buf, nil, std::vector<TargetSpec>(), std::vector<id<MTLBuffer>>(), noVideo, err)) return false;
         out.resize(outSize);
         std::memcpy(out.data(), [buf contents], outSize);
     }
@@ -553,17 +685,24 @@ bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int forma
 // FreeShow can hand the Electron texture straight back to the compositor's frame pool; Finish copies the
 // (already small) result out. Identical contract to the Windows implementation, so the JS side needs no
 // platform branch — its `typeof osr.readbackConsume === "function"` probe simply now succeeds on macOS.
-bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
+bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
     IOSurfaceRef surface = reinterpret_cast<IOSurfaceRef>(handle);
     if (!surface) {
         err = "null IOSurface handle";
         return false;
     }
     const bool wantScaled = dstW > 0 && dstH > 0;
+    const bool haveVideo = video.w && video.h && video.data;
 
     // Frame the GPU path can't take (non-BGRA surface, width not a multiple of 4): convert on the CPU now and
     // stash the bytes for Finish. Rare-to-never in practice, but it keeps the contract total.
     if (!GpuUsable(surface, width, height)) {
+        // The CPU path does not composite. Fail rather than emit a frame with the live input missing — the
+        // caller then falls back to drawing the video in the page, which is slower but correct.
+        if (haveVideo) {
+            err = "video layer requires the Metal path";
+            return false;
+        }
         std::vector<uint8_t> bgra;
         if (!ReadbackCpu(surface, width, height, 0, bgra, err)) return false;  // format 0 = leave as BGRA
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -588,6 +727,19 @@ bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, 
 
     const size_t mainSize = OutBytes(width, height, format);
     const size_t scaledSize = wantScaled ? static_cast<size_t>(dstW) * dstH * 4 : 0;
+
+    // The upload runs BEFORE RunGpu wraps the IOSurface: everything between taking the caller's shared
+    // texture and the convert is time Electron's frame pool waits on us, and a 4K upload in there costs
+    // paints. It is also done outside g_mutex — the local copy holds the texture alive (ARC) — so it never
+    // serializes another output's consume behind it.
+    VideoTex vtex;
+    if (haveVideo) {
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            vtex = g_keys[key].vtex;
+        }
+        if (!UploadVideoLayer(video, vtex, err)) return false;
+    }
 
     id<MTLBuffer> mainBuf = nil;
     id<MTLBuffer> scaledBuf = nil;
@@ -617,9 +769,10 @@ bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, 
             }
         }
         targetBufs = k.targets;
+        if (haveVideo) k.vtex = vtex;  // keep the (possibly newly created) texture for the next frame
     }
 
-    if (!RunGpu(surface, width, height, format, dstW, dstH, mainBuf, scaledBuf, targets, targetBufs, err)) return false;
+    if (!RunGpu(surface, width, height, format, dstW, dstH, mainBuf, scaledBuf, targets, targetBufs, vtex, err)) return false;
 
     std::lock_guard<std::mutex> lock(g_mutex);
     KeyBufs& k = g_keys[key];
@@ -630,7 +783,7 @@ bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, 
 }
 
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
-    return ConsumeImpl(handle, width, height, format, key, dstW, dstH, std::vector<TargetSpec>(), err);
+    return ConsumeImpl(handle, width, height, format, key, dstW, dstH, std::vector<TargetSpec>(), VideoLayer(), err);
 }
 
 bool FinishImpl(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err) {
@@ -734,7 +887,8 @@ bool ReadbackOnce(uintptr_t handle, uint32_t width, uint32_t height, int format,
             err = "failed to allocate Metal output buffer";
             return false;
         }
-        if (!RunGpu(surface, width, height, format, dstW, dstH, mainBuf, scaledBuf, std::vector<TargetSpec>(), std::vector<id<MTLBuffer>>(), err)) return false;
+        VideoTex noVideo;  // no layer on the single-shot paths
+        if (!RunGpu(surface, width, height, format, dstW, dstH, mainBuf, scaledBuf, std::vector<TargetSpec>(), std::vector<id<MTLBuffer>>(), noVideo, err)) return false;
         if (onGpuDone) onGpuDone();
         if (dst && dstSize) std::memcpy(dst, [mainBuf contents], dstSize);
         if (scaledDst && scaledSize && scaledBuf) std::memcpy(scaledDst, [scaledBuf contents], scaledSize);
@@ -758,14 +912,13 @@ const char* ReadbackBackend() {
 
 namespace osrcap {
 bool TargetsSupported() { return true; }
-// The video layer is composited by the Windows path only; elsewhere the page draws the frame as before.
-bool VideoLayerSupported() { return false; }
+// The video layer is composited in the Metal convert pass (see overVideo in kMetalSource).
+bool VideoLayerSupported() { return true; }
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
-    if (video.w) { err = "a video layer is not supported by the macOS backend"; return false; }
-    return ReadbackConsume(handle, width, height, format, key, dstW, dstH, targets, err);
+    return ConsumeImpl(handle, width, height, format, key, dstW, dstH, targets, video, err);
 }
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
-    return ConsumeImpl(handle, width, height, format, key, dstW, dstH, targets, err);
+    return ConsumeImpl(handle, width, height, format, key, dstW, dstH, targets, VideoLayer(), err);
 }
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err) {
     return FinishImpl(key, dst, dstSize, scaledDst, scaledSize, targetDsts, err);

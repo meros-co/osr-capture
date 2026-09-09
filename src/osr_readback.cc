@@ -221,8 +221,11 @@ public:
         if (!videoData.IsEmpty() && videoData.IsBuffer()) videoRef_ = Napi::Persistent(videoData.As<Napi::Object>());
     }
 #elif defined(__linux__)
-    ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred)
-        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred) {}
+    ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, std::vector<osrcap::TargetSpec> targets, Napi::Promise::Deferred deferred, const osrcap::VideoLayer& video = osrcap::VideoLayer(), Napi::Value videoData = Napi::Value())
+        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), targets_(std::move(targets)), deferred_(deferred), video_(video) {
+        // the caller's video buffer is read on the worker thread: keep it alive for the call
+        if (!videoData.IsEmpty() && videoData.IsBuffer()) videoRef_ = Napi::Persistent(videoData.As<Napi::Object>());
+    }
 #endif
     void Execute() override {
         std::string err;
@@ -230,7 +233,8 @@ public:
         bool ok = video_.w ? osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
                            : osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #elif defined(__linux__)
-        bool ok = osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
+        bool ok = video_.w ? osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
+                           : osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #endif
         if (!ok) SetError(err.empty() ? "consume failed" : err);
     }
@@ -456,10 +460,6 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
     uint32_t dstW = (info.Length() > 5 && info[5].IsNumber()) ? info[5].As<Napi::Number>().Uint32Value() : 0;
     uint32_t dstH = (info.Length() > 6 && info[6].IsNumber()) ? info[6].As<Napi::Number>().Uint32Value() : 0;
     auto deferred = Napi::Promise::Deferred::New(env);
-#if defined(_WIN32) || defined(__APPLE__)
-    uintptr_t handle = 0;
-    Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
-    if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     // consume(..., targets, video): `video` = { width, height, format, data } composited under the page
     osrcap::VideoLayer video;
     Napi::Value videoData;
@@ -475,12 +475,16 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
             video.format = v.Has("format") ? v.Get("format").As<Napi::Number>().Int32Value() : 0;
         }
     }
+#if defined(_WIN32) || defined(__APPLE__)
+    uintptr_t handle = 0;
+    Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
+    if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred, video, videoData))->Queue();
 #elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes;
     uint64_t modifier = 0;
     ParseLinuxSource(info[0], planes, modifier);
-    (new ConsumeWorker(env, std::move(planes), modifier, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred))->Queue();
+    (new ConsumeWorker(env, std::move(planes), modifier, w, h, format, std::move(key), dstW, dstH, ParseTargets(info, 7), deferred, video, videoData))->Queue();
 #endif
     return deferred.Promise();
 }
@@ -605,27 +609,19 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     env.SetInstanceData(new AddonData());
     exports.Set("readback", Napi::Function::New(env, Readback));
     exports.Set("releasePool", Napi::Function::New(env, ReleasePool));
-    // The two-phase/once exports are installed ONLY when this platform's GPU path is actually available —
-    // FreeShow keys off `typeof readbackConsume === "function"` (ndiWorker two-phase preference,
-    // OutputLifecycle hasGpuDownscale) and must fall back to single-phase `readback` when only a CPU path
-    // exists. Windows always has D3D11 here (the §5 ladder degrades internally); macOS needs a Metal device;
-    // Linux needs the EGL/GLES3 import to have initialized.
-#if defined(_WIN32)
+#if defined(__APPLE__)
+    osrcap::MacGpuReadbackInit();  // build the Metal pipelines now rather than on the first frame
+#elif defined(__linux__)
+    osrcap::LinuxGpuReadbackInit();  // start the GL thread now rather than on the first frame
+#endif
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+    // Installed on every platform. Each backend degrades to its own CPU path internally when the GPU one
+    // is unavailable, so the absence of these used to cost far more than it saved: FreeShow read
+    // `typeof readbackConsume === "function"` and demoted the whole render group to a main-process
+    // readback, which put full frames back on the main thread — the one thing that must never happen.
     exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
     exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
     exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
-#elif defined(__APPLE__)
-    if (osrcap::MacGpuReadbackInit()) {
-        exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
-        exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
-        exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
-    }
-#elif defined(__linux__)
-    if (osrcap::LinuxGpuReadbackInit()) {
-        exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
-        exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
-        exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
-    }
 #endif
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));

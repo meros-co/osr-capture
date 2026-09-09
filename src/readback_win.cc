@@ -696,15 +696,46 @@ const char* kSwizzleHLSL = R"HLSL(
 Texture2D<float4> gSrc : register(t0);
 RWByteAddressBuffer gDst : register(u0);
 cbuffer SwParams : register(b0) {
-    uint gWidth; uint gHeight;
+    uint gWidth; uint gHeight; uint gKeepBgra; uint gPad0;
+    uint gVideoOn; uint gVideoW; uint gVideoH; uint gVideoFormat;
 };
+// The video layer sits under the page: where the page is transparent, its pixels show through. UYVY is
+// stored as a half-width RGBA texture (U Y0 V Y1 per texel) and decoded with the same limited-range
+// matrices the renderer uses, so a composited frame matches one drawn in the page.
+Texture2D<float4> gVideo : register(t1);
+float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
+    uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
+    uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
+    // 0 = BGRA (the texture's own order), 3 = RGBA (red and blue arrive swapped), 1 = UYVY below
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
+    float4 s = gVideo.Load(int3(vx / 2, vy, 0));
+    float luma = ((vx & 1) == 0) ? s.g : s.a;
+    float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
+    // the layer texture is BGRA, so the UYVY bytes U,Y0,V,Y1 arrive as .b,.g,.r,.a
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
+    float bt = (gVideoH >= 720) ? 1.0 : 0.0;
+    float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
+    float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
+    return saturate(float3(yy + kr * v, yy - gu * u - gv * v, yy + kb * u));
+}
+// page over video, premultiplied: opaque page pixels are untouched
+float4 overVideo(float4 page, uint x, uint y, uint dstW, uint dstH) {
+    if (gVideoOn == 0) return page;
+    if (page.a >= 0.999) return page;
+    return float4(page.rgb + videoAt(x, y, dstW, dstH) * (1.0 - page.a), 1.0);
+}
 int toByte(float v) { return (int)(v * 255.0 + 0.5); }
 [numthreads(8, 8, 1)]
 void SwizzleMain(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= gWidth || tid.y >= gHeight) return;
-    float4 c = gSrc.Load(int3(tid.x, tid.y, 0));  // .r=R .g=G .b=B .a=A
-    uint word = (uint)toByte(c.r) | ((uint)toByte(c.g) << 8) | ((uint)toByte(c.b) << 16) | ((uint)toByte(c.a) << 24);
-    gDst.Store((tid.y * gWidth + tid.x) * 4, word);  // R,G,B,A byte order = RGBA
+    float4 c = overVideo(gSrc.Load(int3(tid.x, tid.y, 0)), tid.x, tid.y, gWidth, gHeight);
+    // gKeepBgra: this pass also serves format 0, whose bytes are B,G,R,A rather than R,G,B,A
+    uint word = gKeepBgra
+        ? ((uint)toByte(c.b) | ((uint)toByte(c.g) << 8) | ((uint)toByte(c.r) << 16) | ((uint)toByte(c.a) << 24))
+        : ((uint)toByte(c.r) | ((uint)toByte(c.g) << 8) | ((uint)toByte(c.b) << 16) | ((uint)toByte(c.a) << 24));
+    gDst.Store((tid.y * gWidth + tid.x) * 4, word);
 }
 )HLSL";
 
@@ -712,8 +743,12 @@ void SwizzleMain(uint3 tid : SV_DispatchThreadID) {
 struct SwParams {
     uint32_t width;
     uint32_t height;
+    uint32_t keepBgra;
     uint32_t pad0;
-    uint32_t pad1;
+    uint32_t videoOn;
+    uint32_t videoW;
+    uint32_t videoH;
+    uint32_t videoFormat;
 };
 
 struct ReadbackContext {
@@ -1362,7 +1397,9 @@ struct ReadbackContext {
 
     // GPU BGRA->RGBA swizzle readback (format 3, WebRTC). Same size as BGRA; the swizzle runs on the GPU so the
     // main process never does the channel swap. Mirrors ReadbackConvert but outputs full-res RGBA.
-    bool ReadbackRgba(ID3D11Texture2D* shared, uint32_t width, uint32_t height, std::vector<uint8_t>& out, std::string& err) {
+    // Also the format-0 path whenever a video layer is active: a plain BGRA copy cannot composite, and
+    // silently dropping the layer shows the transparent page over black.
+    bool ReadbackRgba(ID3D11Texture2D* shared, uint32_t width, uint32_t height, bool keepBgra, std::vector<uint8_t>& out, std::string& err) {
         InvalidateOn12OutBuffer();  // classic-staging consumer: never reuse an on12-wrapped outBuf
         if (!EnsureSwizzleShader()) { err = "swizzle shader init failed"; return false; }
         const size_t total = (size_t)width * 4 * height;
@@ -1375,20 +1412,20 @@ struct ReadbackContext {
         sv.Texture2D.MipLevels = 1;
         if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "SRV creation failed"; return false; }
 
-        SwParams p{ width, height };
+        SwParams p{ width, height, keepBgra ? 1u : 0u, 0u, videoOn ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
         context->UpdateSubresource(swizzleParamsCb.Get(), 0, nullptr, &p, 0, 0);
-        ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+        ID3D11ShaderResourceView* srvs[] = { srv.Get(), videoOn ? videoSrv.Get() : dummySrv.Get() };
         ID3D11UnorderedAccessView* uavs[] = { outUav.Get() };
         ID3D11Buffer* cbs[] = { swizzleParamsCb.Get() };
         context->CSSetShader(swizzleShader.Get(), nullptr, 0);
-        context->CSSetShaderResources(0, 1, srvs);
+        context->CSSetShaderResources(0, 2, srvs);
         context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
         context->CSSetConstantBuffers(0, 1, cbs);
         context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
 
-        ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+        ID3D11ShaderResourceView* nullSrv[] = { nullptr, nullptr };
         ID3D11UnorderedAccessView* nullUav[] = { nullptr };
-        context->CSSetShaderResources(0, 1, nullSrv);
+        context->CSSetShaderResources(0, 2, nullSrv);
         context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
 
         context->CopyResource(outStaging.Get(), outBuf.Get());
@@ -1413,7 +1450,9 @@ struct ReadbackContext {
 
         bool ok;
         if (format == 1 || format == 2) ok = ReadbackConvert(shared.Get(), width, height, format == 2, out, err);
-        else if (format == 3) ok = ReadbackRgba(shared.Get(), width, height, out, err);
+        else if (format == 3) ok = ReadbackRgba(shared.Get(), width, height, false, out, err);
+        // a plain BGRA copy cannot composite, so a layer forces the shader path
+        else if (videoOn) ok = ReadbackRgba(shared.Get(), width, height, true, out, err);
         else ok = ReadbackBgra(shared.Get(), width, height, out, err);
 
         if (haveKeyedMutex) keyedMutex->ReleaseSync(0);
@@ -1523,7 +1562,8 @@ struct ReadbackContext {
         } else {
             // BGRA (multi-consumer / non-off-main): no split benefit; do the full read now into a vector.
             pendingIsConvert = false;
-            ok = ReadbackBgra(shared.Get(), width, height, pendingBgra, err);
+            ok = videoOn ? ReadbackRgba(shared.Get(), width, height, true, pendingBgra, err)
+                         : ReadbackBgra(shared.Get(), width, height, pendingBgra, err);
             pendingTotal = pendingBgra.size();
         }
         // optional GPU downscale for server/stage, queued before the single GPU wait below (small WC copy-out;

@@ -204,30 +204,70 @@ vec3 YUV(vec3 c) {
     float v = (128.0 * s.r - 107.0 * s.g - 21.0 * s.b) / 256.0 + 128.0;
     return vec3(y, u, v) / 255.0;
 }
+// ---- video layer: a live input frame composited UNDER the page, so it never has to travel through the
+// browser's GPU thread to reach the output. The layer texture is uploaded as GL_RGBA/GL_UNSIGNED_BYTE, so
+// channel .r is byte 0 of a texel, .g byte 1, .b byte 2, .a byte 3 (the mirror of kFragCopyBgra's
+// reasoning, and the opposite of the Windows layer texture, which is BGRA).
+uniform sampler2D uVideo;
+uniform int uVideoOn;
+uniform ivec2 uVideoSize;
+uniform int uVideoFormat;
+vec3 videoAt(int x, int y, ivec2 dstSize) {
+    int vx = (dstSize.x == uVideoSize.x) ? x : x * uVideoSize.x / dstSize.x;
+    int vy = (dstSize.y == uVideoSize.y) ? y : y * uVideoSize.y / dstSize.y;
+    vx = clamp(vx, 0, uVideoSize.x - 1);  // dodge out-of-range texelFetch UB on a rounded-up dst pixel
+    vy = clamp(vy, 0, uVideoSize.y - 1);
+    if (uVideoFormat == 0) return texelFetch(uVideo, ivec2(vx, vy), 0).bgr;  // bytes B,G,R,A
+    if (uVideoFormat == 3) return texelFetch(uVideo, ivec2(vx, vy), 0).rgb;  // bytes R,G,B,A
+    vec4 s = texelFetch(uVideo, ivec2(vx / 2, vy), 0);                       // UYVY: bytes U,Y0,V,Y1
+    float luma = ((vx & 1) == 0) ? s.g : s.a;
+    float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float bt = (uVideoSize.y >= 720) ? 1.0 : 0.0;  // BT.601 below 720 lines, BT.709 at or above
+    float kr = mix(1.402, 1.5748, bt), kb = mix(1.772, 1.8556, bt);
+    float gu = mix(0.344136, 0.1873, bt), gv = mix(0.714136, 0.4681, bt);
+    return clamp(vec3(yy + kr * v, yy - gu * u - gv * v, yy + kb * u), 0.0, 1.0);
+}
+// page over video, premultiplied: opaque page pixels are untouched. (x, y) are DESTINATION PIXEL
+// coordinates, which for a packed format are not the fragment coordinates — see each shader.
+vec4 overVideo(vec4 page, int x, int y, ivec2 dstSize) {
+    if (uVideoOn == 0 || page.a >= 0.999) return page;
+    return vec4(page.rgb + videoAt(x, y, dstSize) * (1.0 - page.a), 1.0);
+}
+// One destination pixel of a scaling pass: the box average, over the video layer.
+vec4 PIX(int dx, int dy) { return overVideo(BOX(dx, dy), dx, dy, uDstSize); }
 )GLSL";
 
 // dst texel x covers source pixels 2x, 2x+1; chroma from the even pixel (matches ConvertBgraToUyvyRaw).
 // Output RGBA8 bytes = U, Y0, V, Y1 -> the UYVY wire layout when read back as GL_RGBA/UNSIGNED_BYTE.
+// This pass is 1:1, so uSrcSize IS the destination size the video layer maps onto.
 const char* kFragUyvy = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    vec3 yuv0 = YUV(texelFetch(uTex, SRC(d.x * 2, d.y), 0).rgb);
-    float y1 = YUV(texelFetch(uTex, SRC(d.x * 2 + 1, d.y), 0).rgb).x;
+    int x0 = d.x * 2, x1 = d.x * 2 + 1;
+    vec4 p0 = overVideo(texelFetch(uTex, SRC(x0, d.y), 0), x0, d.y, uSrcSize);
+    vec4 p1 = overVideo(texelFetch(uTex, SRC(x1, d.y), 0), x1, d.y, uSrcSize);
+    vec3 yuv0 = YUV(p0.rgb);
+    float y1 = YUV(p1.rgb).x;
     o = vec4(yuv0.y, yuv0.x, yuv0.z, y1);
 }
 )GLSL";
 
 // UYVA plane 2: pack 4 source alphas per RGBA8 texel (dst width = ceil(w/4)); the copy-out trims the GL
 // row pitch back to w bytes when w % 4 != 0. Coordinates clamped to dodge out-of-range texelFetch UB.
+// Each of the four packed pixels is composited on its own, so an alpha that the video layer made opaque
+// reads back as 1.0 (matching the UYVY plane beside it).
 const char* kFragAlpha = R"GLSL(
+vec4 PAGE(int x, int y) { return overVideo(texelFetch(uTex, SRC(x, y), 0), x, y, uSrcSize); }
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
     int w = textureSize(uTex, 0).x;
     int x0 = d.x * 4;
-    o = vec4(texelFetch(uTex, SRC(min(x0, w - 1), d.y), 0).a,
-             texelFetch(uTex, SRC(min(x0 + 1, w - 1), d.y), 0).a,
-             texelFetch(uTex, SRC(min(x0 + 2, w - 1), d.y), 0).a,
-             texelFetch(uTex, SRC(min(x0 + 3, w - 1), d.y), 0).a);
+    o = vec4(PAGE(min(x0, w - 1), d.y).a,
+             PAGE(min(x0 + 1, w - 1), d.y).a,
+             PAGE(min(x0 + 2, w - 1), d.y).a,
+             PAGE(min(x0 + 3, w - 1), d.y).a);
 }
 )GLSL";
 
@@ -235,7 +275,7 @@ void main() {
 const char* kFragCopyBgra = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    o = texelFetch(uTex, SRC(d.x, d.y), 0).bgra;
+    o = overVideo(texelFetch(uTex, SRC(d.x, d.y), 0), d.x, d.y, uSrcSize).bgra;
 }
 )GLSL";
 
@@ -243,7 +283,7 @@ void main() {
 const char* kFragCopyRgba = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    o = texelFetch(uTex, SRC(d.x, d.y), 0);
+    o = overVideo(texelFetch(uTex, SRC(d.x, d.y), 0), d.x, d.y, uSrcSize);
 }
 )GLSL";
 
@@ -251,7 +291,7 @@ void main() {
 const char* kFragScale = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    o = BOX(d.x, d.y).bgra;
+    o = PIX(d.x, d.y).bgra;
 }
 )GLSL";
 
@@ -261,8 +301,8 @@ void main() {
 const char* kFragScaleUyvy = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    vec3 yuv0 = YUV(BOX(d.x * 2, d.y).rgb);
-    float y1 = YUV(BOX(d.x * 2 + 1, d.y).rgb).x;
+    vec3 yuv0 = YUV(PIX(d.x * 2, d.y).rgb);
+    float y1 = YUV(PIX(d.x * 2 + 1, d.y).rgb).x;
     o = vec4(yuv0.y, yuv0.x, yuv0.z, y1);
 }
 )GLSL";
@@ -272,17 +312,17 @@ void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
     int w = uDstSize.x;
     int x0 = d.x * 4;
-    o = vec4(BOX(min(x0, w - 1), d.y).a,
-             BOX(min(x0 + 1, w - 1), d.y).a,
-             BOX(min(x0 + 2, w - 1), d.y).a,
-             BOX(min(x0 + 3, w - 1), d.y).a);
+    o = vec4(PIX(min(x0, w - 1), d.y).a,
+             PIX(min(x0 + 1, w - 1), d.y).a,
+             PIX(min(x0 + 2, w - 1), d.y).a,
+             PIX(min(x0 + 3, w - 1), d.y).a);
 }
 )GLSL";
 
 const char* kFragScaleRgba = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    o = BOX(d.x, d.y);
+    o = PIX(d.x, d.y);
 }
 )GLSL";
 
@@ -299,21 +339,22 @@ void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
     int w = uDstSize.x;
     int x0 = d.x * 4;
-    o = vec4(LUMA(BOX(min(x0, w - 1), d.y)),
-             LUMA(BOX(min(x0 + 1, w - 1), d.y)),
-             LUMA(BOX(min(x0 + 2, w - 1), d.y)),
-             LUMA(BOX(min(x0 + 3, w - 1), d.y)));
+    o = vec4(LUMA(PIX(min(x0, w - 1), d.y)),
+             LUMA(PIX(min(x0 + 1, w - 1), d.y)),
+             LUMA(PIX(min(x0 + 2, w - 1), d.y)),
+             LUMA(PIX(min(x0 + 3, w - 1), d.y)));
 }
 )GLSL";
 
 // Chroma helpers shared by the U and V shaders: CHROMA(cx, cy) averages the 2x2 destination pixels the
-// chroma sample covers, each of them itself a BOX of the source.
+// chroma sample covers, each of them itself a BOX of the source composited over the video layer (the
+// composite is per destination pixel, before the 2x2 average — as in kScaleI420HLSL).
 const char* kFragI420ChromaPrelude = R"GLSL(
 int SHR8(int n) { return n >= 0 ? (n >> 8) : -((-n + 255) >> 8); }
 vec4 CHROMA(int cx, int cy) {
     int x0 = min(cx * 2, uDstSize.x - 1), x1 = min(cx * 2 + 1, uDstSize.x - 1);
     int y0 = min(cy * 2, uDstSize.y - 1), y1 = min(cy * 2 + 1, uDstSize.y - 1);
-    return (BOX(x0, y0) + BOX(x1, y0) + BOX(x0, y1) + BOX(x1, y1)) * 0.25;
+    return (PIX(x0, y0) + PIX(x1, y0) + PIX(x0, y1) + PIX(x1, y1)) * 0.25;
 }
 )GLSL";
 
@@ -352,6 +393,7 @@ void main() {
 struct Program {
     GLuint id = 0;
     GLint uTex = -1, uFlipY = -1, uSrcH = -1, uSrcSize = -1, uDstSize = -1;
+    GLint uVideo = -1, uVideoOn = -1, uVideoSize = -1, uVideoFormat = -1;
 };
 
 // One plane of one per-consumer target inside the PBO. `rowGl` is the GL row pitch of the render target
@@ -395,6 +437,10 @@ struct KeyState {
     int alphaW = 0, alphaH = 0;
     GLuint texScaled = 0, fboScaled = 0;
     int scaledW = 0, scaledH = 0;
+    // video layer, cached per key (one texture per output: two outputs with differently sized layers must
+    // not thrash a single shared allocation). Reallocated only when the texel dimensions change.
+    GLuint videoTex = 0;
+    int videoTexW = 0, videoTexH = 0;
     std::vector<TargetState> targets;
     GLuint pbo = 0;
     size_t pboCap = 0;
@@ -472,7 +518,8 @@ public:
     // ---- GL-thread-only operations (call via Run/Post) ---------------------------------------------------
     bool ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
                          int format, const std::string& key, uint32_t dstW, uint32_t dstH,
-                         const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed);
+                         const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err,
+                         bool& importFailed);
     bool FinishMapOnThread(const std::string& key, MapResult& res, std::string& err);
     void FinishUnmapOnThread(const std::string& key);
     void ReleaseKeyOnThread(const std::string& key);
@@ -522,6 +569,10 @@ private:
     }
     EGLImageKHR ImportDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h, std::string& err);
     void DropPending(KeyState& ks);
+    // Upload this frame's video layer into the key's texture and arm the draw-time uniforms. Always
+    // called (an empty layer just disarms them), so no draw ever inherits the previous frame's layer.
+    bool SetVideoLayerOnThread(KeyState& ks, const VideoLayer& video, std::string& err);
+    GLuint DummyVideoTex();  // 1x1 black, so texture unit 1 is always complete even with no layer
 
     std::mutex m_;
     std::condition_variable cv_;
@@ -542,6 +593,10 @@ private:
     Program pUyvy_, pAlpha_, pBgra_, pRgba_, pScale_;
     Program pScaleUyvy_, pScaleAlpha_, pScaleRgba_, pI420Luma_, pI420U_, pI420V_;
     std::map<std::string, KeyState> keys_;
+    // the layer state DrawToSized binds; set per consume by SetVideoLayerOnThread
+    GLuint videoTex_ = 0, dummyVideoTex_ = 0;
+    bool videoOn_ = false;
+    int videoW_ = 0, videoH_ = 0, videoFormat_ = 0;
 };
 
 bool GlThread::CompileProgram(Program& p, const char* fragBody, std::string& err) {
@@ -589,6 +644,10 @@ bool GlThread::CompileProgram(Program& p, const char* fragBody, std::string& err
     p.uSrcH = glGetUniformLocation(p.id, "uSrcH");
     p.uSrcSize = glGetUniformLocation(p.id, "uSrcSize");
     p.uDstSize = glGetUniformLocation(p.id, "uDstSize");
+    p.uVideo = glGetUniformLocation(p.id, "uVideo");
+    p.uVideoOn = glGetUniformLocation(p.id, "uVideoOn");
+    p.uVideoSize = glGetUniformLocation(p.id, "uVideoSize");
+    p.uVideoFormat = glGetUniformLocation(p.id, "uVideoFormat");
     return true;
 }
 
@@ -751,7 +810,65 @@ void GlThread::DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int d
     if (p.uSrcH >= 0) glUniform1i(p.uSrcH, srcH);
     if (p.uSrcSize >= 0) glUniform2i(p.uSrcSize, srcW, srcH);
     if (p.uDstSize >= 0) glUniform2i(p.uDstSize, dstW, dstH);
+    // unit 1 is the video layer; leave the active unit back at 0, which the rest of the file assumes.
+    // (DummyVideoTex touches the active unit itself, so resolve it BEFORE selecting unit 1.)
+    const GLuint vtex = videoOn_ ? videoTex_ : DummyVideoTex();
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, vtex);
+    glActiveTexture(GL_TEXTURE0);
+    if (p.uVideo >= 0) glUniform1i(p.uVideo, 1);
+    if (p.uVideoOn >= 0) glUniform1i(p.uVideoOn, videoOn_ ? 1 : 0);
+    if (p.uVideoSize >= 0) glUniform2i(p.uVideoSize, videoW_, videoH_);
+    if (p.uVideoFormat >= 0) glUniform1i(p.uVideoFormat, videoFormat_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+}
+
+GLuint GlThread::DummyVideoTex() {
+    if (dummyVideoTex_) return dummyVideoTex_;
+    glGenTextures(1, &dummyVideoTex_);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, dummyVideoTex_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const uint8_t black[4] = {0, 0, 0, 0};
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black);
+    glActiveTexture(GL_TEXTURE0);
+    return dummyVideoTex_;
+}
+
+bool GlThread::SetVideoLayerOnThread(KeyState& ks, const VideoLayer& video, std::string& err) {
+    videoOn_ = false;
+    videoTex_ = 0;
+    videoW_ = videoH_ = videoFormat_ = 0;
+    if (!video.w || !video.h || !video.data) return true;
+    const uint32_t texels = video.format == 1 ? video.w / 2 : video.w;  // UYVY packs two pixels per texel
+    const uint32_t rowBytes = texels * 4;
+    if (!texels || (size_t)rowBytes * video.h > video.bytes) {
+        err = "video layer buffer too small";
+        return false;
+    }
+    if (!ks.videoTex) glGenTextures(1, &ks.videoTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, ks.videoTex);
+    if (ks.videoTexW != (int)texels || ks.videoTexH != (int)video.h) {
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)texels, (GLsizei)video.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        ks.videoTexW = (int)texels;
+        ks.videoTexH = (int)video.h;
+    }
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)texels, (GLsizei)video.h, GL_RGBA, GL_UNSIGNED_BYTE, video.data);
+    glActiveTexture(GL_TEXTURE0);
+    videoTex_ = ks.videoTex;
+    videoOn_ = true;
+    videoW_ = (int)video.w;
+    videoH_ = (int)video.h;
+    videoFormat_ = video.format;
+    return true;
 }
 
 EGLImageKHR GlThread::ImportDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h, std::string& err) {
@@ -853,7 +970,8 @@ void GlThread::DropPending(KeyState& ks) {
 
 bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
                                int format, const std::string& key, uint32_t dstW, uint32_t dstH,
-                               const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed) {
+                               const std::vector<TargetSpec>& targets, const VideoLayer& video,
+                               std::string& err, bool& importFailed) {
     importFailed = false;
     uint64_t seq = D().frameSeq.fetch_add(1);
     if (planes.empty() || w == 0 || h == 0) {
@@ -876,6 +994,12 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     }
     KeyState& ks = keys_[key];
     DropPending(ks);  // stale consume without a finish (shouldn't happen with single-in-flight per key)
+
+    // ---- video layer (before the import, so a bad layer costs no EGLImage) --------------------------------
+    if (!SetVideoLayerOnThread(ks, video, err)) {
+        Trace8(seq, key, "videoLayer=FAIL");
+        return false;
+    }
 
     // ---- import ------------------------------------------------------------------------------------------
     EGLImageKHR img = ImportDmabuf(planes, modifier, w, h, err);
@@ -1125,6 +1249,13 @@ void GlThread::ReleaseKeyOnThread(const std::string& key) {
     if (ks.texMain) glDeleteTextures(1, &ks.texMain);
     if (ks.texAlpha) glDeleteTextures(1, &ks.texAlpha);
     if (ks.texScaled) glDeleteTextures(1, &ks.texScaled);
+    if (ks.videoTex) {
+        if (videoTex_ == ks.videoTex) {  // never leave the draw state pointing at a deleted texture
+            videoTex_ = 0;
+            videoOn_ = false;
+        }
+        glDeleteTextures(1, &ks.videoTex);
+    }
     for (TargetState& ts : ks.targets) DeleteTargetState(ts);
     if (ks.pbo) {
         glDeleteBuffers(1, &ks.pbo);
@@ -1202,7 +1333,7 @@ const char* BackendName() {
 
 bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
              int format, const std::string& key, uint32_t dstW, uint32_t dstH,
-             const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed) {
+             const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err, bool& importFailed) {
     importFailed = false;
     GlThread& t = GlThread::Instance();
     if (!t.InitOk() || t.Demoted()) {
@@ -1214,7 +1345,7 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
     bool ok = false;
     std::string e;
     bool impFail = false;
-    t.Run([&] { ok = t.ConsumeOnThread(planes, modifier, w, h, format, key, dstW, dstH, targets, e, impFail); });
+    t.Run([&] { ok = t.ConsumeOnThread(planes, modifier, w, h, format, key, dstW, dstH, targets, video, e, impFail); });
     MaybeLogDiag(t);
     if (ok) {
         t.importFails.store(0);
@@ -1240,6 +1371,12 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
         }
     }
     return false;
+}
+
+bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
+             int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+             const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed) {
+    return Consume(planes, modifier, w, h, format, key, dstW, dstH, targets, VideoLayer(), err, importFailed);
 }
 
 bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,

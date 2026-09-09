@@ -28,6 +28,9 @@ namespace linuxgpu {
 bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height,
              int format, const std::string& key, uint32_t dstW, uint32_t dstH,
              const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed);
+bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height,
+             int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+             const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err, bool& importFailed);
 bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
             const std::vector<TargetDst>& targetDsts, std::string& err);
 }  // namespace linuxgpu
@@ -163,6 +166,26 @@ bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, 
     return CpuConsume(planes, modifier, width, height, format, key, dstW, dstH, targets, err);
 }
 
+// With a video layer the GPU path is the only one that can produce a correct frame: the CPU converter has
+// no compositor, and a frame with the live input missing is worse than no frame at all (the caller then
+// falls back to drawing the video in the page). So this overload never takes the CPU fallback.
+bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
+    if (!video.w || !video.h || !video.data) return ReadbackConsume(planes, modifier, width, height, format, key, dstW, dstH, targets, err);
+    if (!linuxgpu::Available()) {
+        err = "video layer requires the GPU readback path";
+        return false;
+    }
+    bool importFailed = false;
+    std::string gerr;
+    if (linuxgpu::Consume(planes, modifier, width, height, format, key, dstW, dstH, targets, video, gerr, importFailed)) {
+        std::lock_guard<std::mutex> lock(g_cpuPendingMutex);
+        g_cpuPending.erase(key);  // as above: no stale CPU-fallback frame may satisfy this key's finish
+        return true;
+    }
+    err = gerr + "; cpu fallback cannot composite a video layer";
+    return false;
+}
+
 bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
     return ReadbackConsume(planes, modifier, width, height, format, key, dstW, dstH, std::vector<TargetSpec>(), err);
 }
@@ -227,6 +250,7 @@ namespace osrcap {
 // The GLES path scales and converts every target in the same pass as the main output (CPU fallback derives
 // them with DownscaleBgraRaw + ConvertBgraInPlace, so the contract is total either way).
 bool TargetsSupported() { return true; }
-// The video layer is composited by the Windows path only; elsewhere the page draws the frame as before.
-bool VideoLayerSupported() { return false; }
+// The GLES convert/scale shaders composite the layer under the page (GPU path only — see the video
+// overload of ReadbackConsume); macOS still draws the frame in the page.
+bool VideoLayerSupported() { return true; }
 }  // namespace osrcap
