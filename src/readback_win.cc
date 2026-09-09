@@ -568,8 +568,10 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
         // via a 32-bit read-modify-write is not available on raw buffers, so the pair is packed per 4 pixels
         // by the thread whose px % 4 == 0 using its neighbour pair's alpha.
         if ((px & 3) == 0) {
-            float4 c2 = (px + 2 < gDstW) ? boxAvg(px + 2, y) : c1;
-            float4 c3 = (px + 3 < gDstW) ? boxAvg(px + 3, y) : c2;
+            // composited like c0/c1: a pixel the video shows through has alpha 1, and taking the page's
+            // alpha for only half of each group of four left the plane inconsistent across the row
+            float4 c2 = (px + 2 < gDstW) ? overVideo(boxAvg(px + 2, y), px + 2, y, gDstW, gDstH) : c1;
+            float4 c3 = (px + 3 < gDstW) ? overVideo(boxAvg(px + 3, y), px + 3, y, gDstW, gDstH) : c2;
             uint aword = (uint)toByte(c0.a) | ((uint)toByte(c1.a)<<8) | ((uint)toByte(c2.a)<<16) | ((uint)toByte(c3.a)<<24);
             gDst.Store(gUyvySize + y * gDstW + px, aword);
         }
