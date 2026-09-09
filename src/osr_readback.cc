@@ -230,8 +230,7 @@ public:
         bool ok = video_.w ? osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
                            : osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #elif defined(__linux__)
-        bool ok = targets_.empty() ? osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, err) : false;
-        if (!targets_.empty()) err = "per-consumer targets are not supported by the Linux backend";
+        bool ok = osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #endif
         if (!ok) SetError(err.empty() ? "consume failed" : err);
     }
@@ -278,12 +277,7 @@ public:
     }
     void Execute() override {
         std::string err;
-#if defined(__linux__)
-        bool ok = targetDsts_.empty() ? osrcap::ReadbackFinish(key_, dst_, dstSize_, scaledDst_, scaledSize_, err) : false;
-        if (!targetDsts_.empty()) err = "per-consumer targets are not supported by the Linux backend";
-#else
         bool ok = osrcap::ReadbackFinish(key_, dst_, dstSize_, scaledDst_, scaledSize_, targetDsts_, err);
-#endif
         if (!ok) SetError(err.empty() ? "finish failed" : err);
     }
     void OnOK() override {

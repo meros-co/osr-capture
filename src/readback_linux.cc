@@ -22,6 +22,15 @@
 #include "readback_linux_gpu.h"
 
 namespace osrcap {
+namespace linuxgpu {
+// The targets-aware overloads of Consume/Finish, declared here rather than in readback_linux_gpu.h so this
+// change touches only the two .cc files; they are defined in readback_linux_gpu.cc.
+bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height,
+             int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+             const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed);
+bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
+            const std::vector<TargetDst>& targetDsts, std::string& err);
+}  // namespace linuxgpu
 
 namespace {
 // DRM_FORMAT_MOD_LINEAR
@@ -66,15 +75,26 @@ bool ReadLinearBgra(const std::vector<DmabufPlane>& planes, uint64_t modifier, u
 struct CpuPending {
     std::vector<uint8_t> main;
     std::vector<uint8_t> scaled;
+    std::vector<std::vector<uint8_t>> targets;
 };
 std::map<std::string, CpuPending> g_cpuPending;
 std::mutex g_cpuPendingMutex;
 
-bool CpuConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
+bool CpuConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
     CpuPending p;
     std::vector<uint8_t> bgra;
     if (!ReadLinearBgra(planes, modifier, width, height, bgra, err)) return false;
     if (dstW > 0 && dstH > 0) DownscaleBgraRaw(bgra.data(), width, height, dstW, dstH, p.scaled);
+    // targets too, so a frame the GPU path cannot take still satisfies every consumer
+    p.targets.assign(targets.size(), std::vector<uint8_t>());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        const TargetSpec& t = targets[i];
+        if (!t.w || !t.h) continue;
+        std::vector<uint8_t> small;
+        DownscaleBgraRaw(bgra.data(), width, height, t.w, t.h, small);
+        ConvertBgraInPlace(small, t.w, t.h, t.format);
+        p.targets[i].swap(small);
+    }
     ConvertBgraInPlace(bgra, width, height, format);  // 1/2/3 convert in place; 0 stays BGRA
     p.main = std::move(bgra);
     std::lock_guard<std::mutex> lock(g_cpuPendingMutex);
@@ -124,11 +144,11 @@ bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, u
 // Two-phase readback (Linux flavour of the Windows contract, see osr_readback.h): consume returns once
 // the dmabuf can be released; finish does the copy-out. GPU when possible; CPU fallback keeps the
 // contract for LINEAR buffers so the JS caller never has to care which path ran.
-bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
+bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err) {
     if (linuxgpu::Available()) {
         std::string gerr;
         bool importFailed = false;
-        if (linuxgpu::Consume(planes, modifier, width, height, format, key, dstW, dstH, gerr, importFailed)) {
+        if (linuxgpu::Consume(planes, modifier, width, height, format, key, dstW, dstH, targets, gerr, importFailed)) {
             // drop any stale CPU-fallback pending for this key (a consumed-but-never-finished frame from an
             // earlier import failure) so finish can't return old pixels
             std::lock_guard<std::mutex> lock(g_cpuPendingMutex);
@@ -136,14 +156,18 @@ bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, 
             return true;
         }
         std::string cerr2;
-        if (CpuConsume(planes, modifier, width, height, format, key, dstW, dstH, cerr2)) return true;
+        if (CpuConsume(planes, modifier, width, height, format, key, dstW, dstH, targets, cerr2)) return true;
         err = gerr + "; cpu fallback: " + cerr2;
         return false;
     }
-    return CpuConsume(planes, modifier, width, height, format, key, dstW, dstH, err);
+    return CpuConsume(planes, modifier, width, height, format, key, dstW, dstH, targets, err);
 }
 
-bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
+    return ReadbackConsume(planes, modifier, width, height, format, key, dstW, dstH, std::vector<TargetSpec>(), err);
+}
+
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err) {
     // A CPU-fallback consume takes precedence (it only exists when the GPU consume didn't run).
     {
         std::lock_guard<std::mutex> lock(g_cpuPendingMutex);
@@ -157,12 +181,21 @@ bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_
                 size_t sn = p.scaled.size() < scaledSize ? p.scaled.size() : scaledSize;
                 std::memcpy(scaledDst, p.scaled.data(), sn);
             }
+            for (size_t i = 0; i < targetDsts.size() && i < p.targets.size(); ++i) {
+                if (!targetDsts[i].data || !targetDsts[i].size) continue;
+                size_t tn = p.targets[i].size() < targetDsts[i].size ? p.targets[i].size() : targetDsts[i].size;
+                std::memcpy(targetDsts[i].data, p.targets[i].data(), tn);
+            }
             return true;
         }
     }
-    if (linuxgpu::Initialized()) return linuxgpu::Finish(key, dst, dstSize, scaledDst, scaledSize, err);
+    if (linuxgpu::Initialized()) return linuxgpu::Finish(key, dst, dstSize, scaledDst, scaledSize, targetDsts, err);
     err = "no pending consume for key";
     return false;
+}
+
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+    return ReadbackFinish(key, dst, dstSize, scaledDst, scaledSize, std::vector<TargetDst>(), err);
 }
 
 void ReadbackReleaseKey(const std::string& key) {
@@ -191,8 +224,9 @@ bool ReadbackOnce(const std::vector<DmabufPlane>& planes, uint64_t modifier, uin
 }  // namespace osrcap
 
 namespace osrcap {
-// Per-consumer targets are not produced by the GLES path yet: the caller downscales/converts on the CPU.
-bool TargetsSupported() { return false; }
+// The GLES path scales and converts every target in the same pass as the main output (CPU fallback derives
+// them with DownscaleBgraRaw + ConvertBgraInPlace, so the contract is total either way).
+bool TargetsSupported() { return true; }
 // The video layer is composited by the Windows path only; elsewhere the page draws the frame as before.
 bool VideoLayerSupported() { return false; }
 }  // namespace osrcap

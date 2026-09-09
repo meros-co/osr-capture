@@ -135,6 +135,9 @@ bool LinuxGpuReadbackInit();
 // back to the CPU path internally (LINEAR only) so the contract holds either way.
 bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err);
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err);
+// ... and with per-consumer targets, produced in the same GPU pass (see TargetSpec above).
+bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, std::string& err);
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, const std::vector<TargetDst>& targetDsts, std::string& err);
 void ReadbackReleaseKey(const std::string& key);  // drop pending state + cached GL resources for `key`
 
 // Single-dispatch readback (parity with the Windows ReadbackOnce): consume + onGpuDone + finish.

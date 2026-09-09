@@ -175,8 +175,27 @@ precision highp int;
 uniform sampler2D uTex;
 uniform int uFlipY;
 uniform int uSrcH;
+uniform ivec2 uSrcSize;
+uniform ivec2 uDstSize;
 out vec4 o;
 ivec2 SRC(int x, int y) { return ivec2(x, uFlipY == 1 ? (uSrcH - 1 - y) : y); }
+// Box-average the source rect that maps to destination pixel (dx, dy). uDstSize is left unset (0) by the
+// non-scaling shaders, so BOX degenerates to the plain fetch they used before.
+vec4 BOX(int dx, int dy) {
+    if (uDstSize.x <= 0 || uSrcSize == uDstSize) return texelFetch(uTex, SRC(dx, dy), 0);
+    int sx0 = dx * uSrcSize.x / uDstSize.x;
+    int sx1 = min(max(sx0 + 1, (dx + 1) * uSrcSize.x / uDstSize.x), uSrcSize.x);
+    int sy0 = dy * uSrcSize.y / uDstSize.y;
+    int sy1 = min(max(sy0 + 1, (dy + 1) * uSrcSize.y / uDstSize.y), uSrcSize.y);
+    vec4 acc = vec4(0.0);
+    int n = 0;
+    for (int sy = sy0; sy < sy1; ++sy)
+        for (int sx = sx0; sx < sx1; ++sx) {
+            acc += texelFetch(uTex, SRC(sx, sy), 0);
+            ++n;
+        }
+    return acc / float(n);
+}
 // BT.601 full range; the exact integer coefficients of convert.cc (x/256 on 0..255 inputs).
 vec3 YUV(vec3 c) {
     vec3 s = c * 255.0;
@@ -230,22 +249,103 @@ void main() {
 
 // Box-filter downscale to BGRA (same semantics as convert.cc DownscaleBgra / the Windows scale pass).
 const char* kFragScale = R"GLSL(
-uniform ivec2 uSrcSize;
-uniform ivec2 uDstSize;
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
-    int sx0 = d.x * uSrcSize.x / uDstSize.x;
-    int sx1 = min(max(sx0 + 1, (d.x + 1) * uSrcSize.x / uDstSize.x), uSrcSize.x);
-    int sy0 = d.y * uSrcSize.y / uDstSize.y;
-    int sy1 = min(max(sy0 + 1, (d.y + 1) * uSrcSize.y / uDstSize.y), uSrcSize.y);
-    vec4 acc = vec4(0.0);
-    int n = 0;
-    for (int sy = sy0; sy < sy1; ++sy)
-        for (int sx = sx0; sx < sx1; ++sx) {
-            acc += texelFetch(uTex, SRC(sx, sy), 0);
-            ++n;
-        }
-    o = (acc / float(n)).bgra;
+    o = BOX(d.x, d.y).bgra;
+}
+)GLSL";
+
+// ---- per-consumer targets: the same conversions, but sampling through BOX so one pass scales AND converts.
+// uDstSize is the target's size in DESTINATION PIXELS; the viewport is the packed texel width (see DrawToSized).
+
+const char* kFragScaleUyvy = R"GLSL(
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    vec3 yuv0 = YUV(BOX(d.x * 2, d.y).rgb);
+    float y1 = YUV(BOX(d.x * 2 + 1, d.y).rgb).x;
+    o = vec4(yuv0.y, yuv0.x, yuv0.z, y1);
+}
+)GLSL";
+
+const char* kFragScaleAlpha = R"GLSL(
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    int w = uDstSize.x;
+    int x0 = d.x * 4;
+    o = vec4(BOX(min(x0, w - 1), d.y).a,
+             BOX(min(x0 + 1, w - 1), d.y).a,
+             BOX(min(x0 + 2, w - 1), d.y).a,
+             BOX(min(x0 + 3, w - 1), d.y).a);
+}
+)GLSL";
+
+const char* kFragScaleRgba = R"GLSL(
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    o = BOX(d.x, d.y);
+}
+)GLSL";
+
+// I420 (BT.601 limited range), the exact integer arithmetic of kScaleI420HLSL in readback_win.cc. SHR8 is
+// an explicit floor-divide because GLSL ES leaves >> on a negative signed value implementation-defined,
+// while the HLSL it must match shifts arithmetically.
+const char* kFragI420Luma = R"GLSL(
+int SHR8(int n) { return n >= 0 ? (n >> 8) : -((-n + 255) >> 8); }
+float LUMA(vec4 c) {
+    int r = int(c.r * 255.0 + 0.5), g = int(c.g * 255.0 + 0.5), b = int(c.b * 255.0 + 0.5);
+    return float(clamp(SHR8(66 * r + 129 * g + 25 * b + 128) + 16, 16, 235)) / 255.0;
+}
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    int w = uDstSize.x;
+    int x0 = d.x * 4;
+    o = vec4(LUMA(BOX(min(x0, w - 1), d.y)),
+             LUMA(BOX(min(x0 + 1, w - 1), d.y)),
+             LUMA(BOX(min(x0 + 2, w - 1), d.y)),
+             LUMA(BOX(min(x0 + 3, w - 1), d.y)));
+}
+)GLSL";
+
+// Chroma helpers shared by the U and V shaders: CHROMA(cx, cy) averages the 2x2 destination pixels the
+// chroma sample covers, each of them itself a BOX of the source.
+const char* kFragI420ChromaPrelude = R"GLSL(
+int SHR8(int n) { return n >= 0 ? (n >> 8) : -((-n + 255) >> 8); }
+vec4 CHROMA(int cx, int cy) {
+    int x0 = min(cx * 2, uDstSize.x - 1), x1 = min(cx * 2 + 1, uDstSize.x - 1);
+    int y0 = min(cy * 2, uDstSize.y - 1), y1 = min(cy * 2 + 1, uDstSize.y - 1);
+    return (BOX(x0, y0) + BOX(x1, y0) + BOX(x0, y1) + BOX(x1, y1)) * 0.25;
+}
+)GLSL";
+
+const char* kFragI420U = R"GLSL(
+float U8(vec4 c) {
+    int r = int(c.r * 255.0 + 0.5), g = int(c.g * 255.0 + 0.5), b = int(c.b * 255.0 + 0.5);
+    return float(clamp(SHR8(-38 * r - 74 * g + 112 * b + 128) + 128, 16, 240)) / 255.0;
+}
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    int cwm = max(uDstSize.x / 2 - 1, 0);
+    int c0 = d.x * 4;
+    o = vec4(U8(CHROMA(min(c0, cwm), d.y)),
+             U8(CHROMA(min(c0 + 1, cwm), d.y)),
+             U8(CHROMA(min(c0 + 2, cwm), d.y)),
+             U8(CHROMA(min(c0 + 3, cwm), d.y)));
+}
+)GLSL";
+
+const char* kFragI420V = R"GLSL(
+float V8(vec4 c) {
+    int r = int(c.r * 255.0 + 0.5), g = int(c.g * 255.0 + 0.5), b = int(c.b * 255.0 + 0.5);
+    return float(clamp(SHR8(112 * r - 94 * g - 18 * b + 128) + 128, 16, 240)) / 255.0;
+}
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    int cwm = max(uDstSize.x / 2 - 1, 0);
+    int c0 = d.x * 4;
+    o = vec4(V8(CHROMA(min(c0, cwm), d.y)),
+             V8(CHROMA(min(c0 + 1, cwm), d.y)),
+             V8(CHROMA(min(c0 + 2, cwm), d.y)),
+             V8(CHROMA(min(c0 + 3, cwm), d.y)));
 }
 )GLSL";
 
@@ -253,6 +353,38 @@ struct Program {
     GLuint id = 0;
     GLint uTex = -1, uFlipY = -1, uSrcH = -1, uSrcSize = -1, uDstSize = -1;
 };
+
+// One plane of one per-consumer target inside the PBO. `rowGl` is the GL row pitch of the render target
+// (always a whole number of RGBA8 texels); `rowDst` is what the destination wants per row, which is
+// smaller whenever the packing rounded the texel width up.
+struct TargetPlane {
+    size_t off = 0;
+    uint32_t rowGl = 0, rowDst = 0, rows = 0;
+};
+constexpr int kMaxTargetPlanes = 3;  // I420 (Y, U, V) is the widest case
+struct TargetLayout {
+    int nPlanes = 0;
+    TargetPlane plane[kMaxTargetPlanes];
+    size_t dstBytes = 0;  // TargetBytes(spec)
+};
+// Per-target GPU state, cached per key exactly like texMain/texScaled (reallocated only on a size change).
+struct TargetState {
+    GLuint tex[kMaxTargetPlanes] = {0, 0, 0};
+    GLuint fbo[kMaxTargetPlanes] = {0, 0, 0};
+    int w[kMaxTargetPlanes] = {0, 0, 0};
+    int h[kMaxTargetPlanes] = {0, 0, 0};
+    TargetLayout layout;
+};
+
+void DeleteTargetState(TargetState& ts) {
+    for (int i = 0; i < kMaxTargetPlanes; ++i) {
+        if (ts.fbo[i]) glDeleteFramebuffers(1, &ts.fbo[i]);
+        if (ts.tex[i]) glDeleteTextures(1, &ts.tex[i]);
+        ts.fbo[i] = 0;
+        ts.tex[i] = 0;
+        ts.w[i] = ts.h[i] = 0;
+    }
+}
 
 // Cached per-key GL state + the pending (consumed, not yet finished) frame. GL-THREAD-ONLY.
 struct KeyState {
@@ -263,6 +395,7 @@ struct KeyState {
     int alphaW = 0, alphaH = 0;
     GLuint texScaled = 0, fboScaled = 0;
     int scaledW = 0, scaledH = 0;
+    std::vector<TargetState> targets;
     GLuint pbo = 0;
     size_t pboCap = 0;
     // pending frame
@@ -275,6 +408,7 @@ struct KeyState {
     size_t alphaOff = 0;                        // PBO offset of the alpha rows (format 2)
     uint32_t alphaRowGl = 0;                    // GL row pitch of the alpha rows (ceil(w/4)*4)
     size_t scaledOff = 0, scaledBytes = 0;      // PBO offset/bytes of the downscaled BGRA (0 = none)
+    std::vector<TargetLayout> targetLayout;     // per-consumer targets, in caller order
     size_t total = 0;                           // whole PBO payload
 };
 
@@ -285,6 +419,7 @@ struct MapResult {
     uint32_t w = 0, h = 0;
     size_t mainBytes = 0, alphaOff = 0, scaledOff = 0, scaledBytes = 0;
     uint32_t alphaRowGl = 0;
+    std::vector<TargetLayout> targets;
 };
 
 class GlThread {
@@ -336,7 +471,8 @@ public:
 
     // ---- GL-thread-only operations (call via Run/Post) ---------------------------------------------------
     bool ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
-                         int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err, bool& importFailed);
+                         int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+                         const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed);
     bool FinishMapOnThread(const std::string& key, MapResult& res, std::string& err);
     void FinishUnmapOnThread(const std::string& key);
     void ReleaseKeyOnThread(const std::string& key);
@@ -379,7 +515,11 @@ private:
     bool InitGl();
     bool CompileProgram(Program& p, const char* fragBody, std::string& err);
     bool EnsureTarget(GLuint& tex, GLuint& fbo, int& curW, int& curH, int w, int h, std::string& err);
-    void DrawTo(const Program& p, GLuint fbo, int dstW, int dstH, GLuint srcTex, int srcW, int srcH);
+    // Packed formats render fewer texels than they describe pixels, so the viewport and uDstSize differ.
+    void DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int dstW, int dstH, GLuint srcTex, int srcW, int srcH);
+    void DrawTo(const Program& p, GLuint fbo, int dstW, int dstH, GLuint srcTex, int srcW, int srcH) {
+        DrawToSized(p, fbo, dstW, dstH, dstW, dstH, srcTex, srcW, srcH);
+    }
     EGLImageKHR ImportDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h, std::string& err);
     void DropPending(KeyState& ks);
 
@@ -400,6 +540,7 @@ private:
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR_ = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
     Program pUyvy_, pAlpha_, pBgra_, pRgba_, pScale_;
+    Program pScaleUyvy_, pScaleAlpha_, pScaleRgba_, pI420Luma_, pI420U_, pI420V_;
     std::map<std::string, KeyState> keys_;
 };
 
@@ -560,9 +701,14 @@ bool GlThread::InitGl() {
     }
 
     std::string serr;
+    const std::string i420u = std::string(kFragI420ChromaPrelude) + kFragI420U;
+    const std::string i420v = std::string(kFragI420ChromaPrelude) + kFragI420V;
     if (!CompileProgram(pUyvy_, kFragUyvy, serr) || !CompileProgram(pAlpha_, kFragAlpha, serr) ||
         !CompileProgram(pBgra_, kFragCopyBgra, serr) || !CompileProgram(pRgba_, kFragCopyRgba, serr) ||
-        !CompileProgram(pScale_, kFragScale, serr)) {
+        !CompileProgram(pScale_, kFragScale, serr) || !CompileProgram(pScaleUyvy_, kFragScaleUyvy, serr) ||
+        !CompileProgram(pScaleAlpha_, kFragScaleAlpha, serr) || !CompileProgram(pScaleRgba_, kFragScaleRgba, serr) ||
+        !CompileProgram(pI420Luma_, kFragI420Luma, serr) || !CompileProgram(pI420U_, i420u.c_str(), serr) ||
+        !CompileProgram(pI420V_, i420v.c_str(), serr)) {
         initErr_ = serr;
         return false;
     }
@@ -594,9 +740,9 @@ bool GlThread::EnsureTarget(GLuint& tex, GLuint& fbo, int& curW, int& curH, int 
     return true;
 }
 
-void GlThread::DrawTo(const Program& p, GLuint fbo, int dstW, int dstH, GLuint srcTex, int srcW, int srcH) {
+void GlThread::DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int dstW, int dstH, GLuint srcTex, int srcW, int srcH) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glViewport(0, 0, dstW, dstH);
+    glViewport(0, 0, vpW, vpH);
     glUseProgram(p.id);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcTex);
@@ -706,7 +852,8 @@ void GlThread::DropPending(KeyState& ks) {
 }
 
 bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
-                               int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err, bool& importFailed) {
+                               int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+                               const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed) {
     importFailed = false;
     uint64_t seq = D().frameSeq.fetch_add(1);
     if (planes.empty() || w == 0 || h == 0) {
@@ -716,6 +863,16 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     if ((format == 1 || format == 2) && (w & 1)) {
         err = "odd width unsupported for UYVY/UYVA";
         return false;
+    }
+    for (const TargetSpec& t : targets) {
+        if ((t.format == 1 || t.format == 2) && (t.w & 1)) {
+            err = "odd target width unsupported for UYVY/UYVA";
+            return false;
+        }
+        if (t.format == 4 && t.w && t.h && (t.w < 2 || t.h < 2)) {
+            err = "I420 target smaller than 2x2";
+            return false;
+        }
     }
     KeyState& ks = keys_[key];
     DropPending(ks);  // stale consume without a finish (shouldn't happen with single-in-flight per key)
@@ -775,6 +932,53 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     bool ok = EnsureTarget(ks.texMain, ks.fboMain, ks.mainW, ks.mainH, mainTexW, (int)h, err);
     if (ok && format == 2) ok = EnsureTarget(ks.texAlpha, ks.fboAlpha, ks.alphaW, ks.alphaH, (int)alphaTexW, (int)h, err);
     if (ok && wantScaled) ok = EnsureTarget(ks.texScaled, ks.fboScaled, ks.scaledW, ks.scaledH, (int)dstW, (int)dstH, err);
+
+    // ---- per-consumer targets: lay their planes out after the scaled region and allocate the FBOs -------
+    struct TargetDraw {
+        GLuint fbo;
+        int vpW, vpH, dstW, dstH;
+        const Program* prog;
+        size_t off;
+    };
+    std::vector<TargetDraw> tdraws;
+    for (size_t i = targets.size(); i < ks.targets.size(); ++i) DeleteTargetState(ks.targets[i]);
+    ks.targets.resize(targets.size());
+    size_t off = total;
+    for (size_t i = 0; i < targets.size() && ok; ++i) {
+        TargetState& ts = ks.targets[i];
+        ts.layout = TargetLayout();
+        const TargetSpec& t = targets[i];
+        if (!t.w || !t.h) continue;
+        const int tw = (int)t.w, th = (int)t.h;
+        ts.layout.dstBytes = TargetBytes(t);
+        // plane idx renders vpW x vpH RGBA8 texels; the copy-out trims each GL row (vpW * 4) back to rowDst
+        auto plane = [&](int idx, int vpW, int vpH, uint32_t rowDst, const Program& pr) {
+            if (!ok) return;
+            ok = EnsureTarget(ts.tex[idx], ts.fbo[idx], ts.w[idx], ts.h[idx], vpW, vpH, err);
+            if (!ok) return;
+            TargetPlane& pl = ts.layout.plane[idx];
+            pl.off = off;
+            pl.rowGl = (uint32_t)vpW * 4;
+            pl.rowDst = rowDst;
+            pl.rows = (uint32_t)vpH;
+            off += (size_t)pl.rowGl * pl.rows;
+            ts.layout.nPlanes = idx + 1;
+            tdraws.push_back({ts.fbo[idx], vpW, vpH, tw, th, &pr, pl.off});
+        };
+        if (t.format == 1 || t.format == 2) {
+            plane(0, tw / 2, th, (uint32_t)tw * 2, pScaleUyvy_);
+            if (t.format == 2) plane(1, (tw + 3) / 4, th, (uint32_t)tw, pScaleAlpha_);
+        } else if (t.format == 4) {
+            const int cw = tw / 2;
+            plane(0, (tw + 3) / 4, th, (uint32_t)tw, pI420Luma_);
+            plane(1, (cw + 3) / 4, th / 2, (uint32_t)cw, pI420U_);
+            plane(2, (cw + 3) / 4, th / 2, (uint32_t)cw, pI420V_);
+        } else {
+            plane(0, tw, th, (uint32_t)tw * 4, t.format == 3 ? pScaleRgba_ : pScale_);
+        }
+    }
+    total = off;
+
     if (ok) {
         if (!ks.pbo) {
             glGenBuffers(1, &ks.pbo);
@@ -801,6 +1005,8 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     DrawTo(mainProg, ks.fboMain, mainTexW, (int)h, srcTex, (int)w, (int)h);
     if (format == 2) DrawTo(pAlpha_, ks.fboAlpha, (int)alphaTexW, (int)h, srcTex, (int)w, (int)h);
     if (wantScaled) DrawTo(pScale_, ks.fboScaled, (int)dstW, (int)dstH, srcTex, (int)w, (int)h);
+    for (const TargetDraw& td : tdraws)
+        DrawToSized(*td.prog, td.fbo, td.vpW, td.vpH, td.dstW, td.dstH, srcTex, (int)w, (int)h);
     GLsync fenceDraw = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     D().fenceCreated.fetch_add(1);
 
@@ -815,6 +1021,10 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     if (wantScaled) {
         glBindFramebuffer(GL_FRAMEBUFFER, ks.fboScaled);
         glReadPixels(0, 0, (GLsizei)dstW, (GLsizei)dstH, GL_RGBA, GL_UNSIGNED_BYTE, (void*)(uintptr_t)scaledOff);
+    }
+    for (const TargetDraw& td : tdraws) {
+        glBindFramebuffer(GL_FRAMEBUFFER, td.fbo);
+        glReadPixels(0, 0, (GLsizei)td.vpW, (GLsizei)td.vpH, GL_RGBA, GL_UNSIGNED_BYTE, (void*)(uintptr_t)td.off);
     }
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     GLsync fenceRead = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -852,6 +1062,8 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     ks.alphaRowGl = alphaRowGl;
     ks.scaledOff = scaledOff;
     ks.scaledBytes = scaledBytes;
+    ks.targetLayout.clear();
+    for (const TargetState& ts : ks.targets) ks.targetLayout.push_back(ts.layout);
     ks.total = total;
     return true;
 }
@@ -892,6 +1104,7 @@ bool GlThread::FinishMapOnThread(const std::string& key, MapResult& res, std::st
     res.alphaRowGl = ks.alphaRowGl;
     res.scaledOff = ks.scaledOff;
     res.scaledBytes = ks.scaledBytes;
+    res.targets = ks.targetLayout;
     return true;
 }
 
@@ -912,6 +1125,7 @@ void GlThread::ReleaseKeyOnThread(const std::string& key) {
     if (ks.texMain) glDeleteTextures(1, &ks.texMain);
     if (ks.texAlpha) glDeleteTextures(1, &ks.texAlpha);
     if (ks.texScaled) glDeleteTextures(1, &ks.texScaled);
+    for (TargetState& ts : ks.targets) DeleteTargetState(ts);
     if (ks.pbo) {
         glDeleteBuffers(1, &ks.pbo);
         D().pboDestroyed.fetch_add(1);
@@ -987,7 +1201,8 @@ const char* BackendName() {
 }
 
 bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
-             int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err, bool& importFailed) {
+             int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+             const std::vector<TargetSpec>& targets, std::string& err, bool& importFailed) {
     importFailed = false;
     GlThread& t = GlThread::Instance();
     if (!t.InitOk() || t.Demoted()) {
@@ -999,7 +1214,7 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
     bool ok = false;
     std::string e;
     bool impFail = false;
-    t.Run([&] { ok = t.ConsumeOnThread(planes, modifier, w, h, format, key, dstW, dstH, e, impFail); });
+    t.Run([&] { ok = t.ConsumeOnThread(planes, modifier, w, h, format, key, dstW, dstH, targets, e, impFail); });
     MaybeLogDiag(t);
     if (ok) {
         t.importFails.store(0);
@@ -1027,7 +1242,13 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
     return false;
 }
 
-bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h,
+             int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err, bool& importFailed) {
+    return Consume(planes, modifier, w, h, format, key, dstW, dstH, std::vector<TargetSpec>(), err, importFailed);
+}
+
+bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
+            const std::vector<TargetDst>& targetDsts, std::string& err) {
     GlThread& t = GlThread::Instance();
     if (!t.InitOk()) {
         err = "linux gpu readback unavailable";
@@ -1074,6 +1295,30 @@ bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scale
         size_t n = res.scaledBytes < scaledSize ? res.scaledBytes : scaledSize;
         std::memcpy(scaledDst, res.ptr + res.scaledOff, n);
     }
+    for (size_t i = 0; i < targetDsts.size() && i < res.targets.size(); ++i) {
+        uint8_t* td = targetDsts[i].data;
+        const size_t cap = targetDsts[i].size;
+        if (!td || !cap) continue;
+        const TargetLayout& tl = res.targets[i];
+        size_t dstOff = 0;  // a target's planes are tightly packed in the destination, in plane order
+        for (int pi = 0; pi < tl.nPlanes && dstOff < cap; ++pi) {
+            const TargetPlane& pl = tl.plane[pi];
+            const uint8_t* src = res.ptr + pl.off;
+            if (pl.rowGl == pl.rowDst) {
+                size_t n = (size_t)pl.rowDst * pl.rows;
+                if (n > cap - dstOff) n = cap - dstOff;
+                std::memcpy(td + dstOff, src, n);
+                dstOff += n;
+                continue;
+            }
+            // the texel packing rounded the row up: trim each GL row back to rowDst bytes
+            for (uint32_t y = 0; y < pl.rows && dstOff < cap; ++y) {
+                size_t n = pl.rowDst < cap - dstOff ? pl.rowDst : cap - dstOff;
+                std::memcpy(td + dstOff, src + (size_t)y * pl.rowGl, n);
+                dstOff += n;
+            }
+        }
+    }
 
     // Recycle the PBO (unmap) on the GL thread; fire-and-forget — the queue orders it before any
     // subsequent consume for this key (the caller only reuses a key after finish returns).
@@ -1081,6 +1326,10 @@ bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scale
     std::string k = key;
     tp->Post([tp, k] { tp->FinishUnmapOnThread(k); });
     return true;
+}
+
+bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err) {
+    return Finish(key, dst, dstSize, scaledDst, scaledSize, std::vector<TargetDst>(), err);
 }
 
 void ReleaseKey(const std::string& key) {

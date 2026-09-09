@@ -86,6 +86,46 @@ bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t heig
         for (size_t i = 0; i < n; ++i) std::swap(p[i * 4], p[i * 4 + 2]);
         return true;
     }
+    // format 4 = planar I420 (Y, then U, then V at half resolution), BT.601 limited range — the same
+    // coefficients as the GPU kernels, so a CPU-fallback frame matches a GPU one.
+    if (format == 4) {
+        const uint32_t cw = width / 2, ch = height / 2;
+        std::vector<uint8_t> out(static_cast<size_t>(width) * height + 2u * static_cast<size_t>(cw) * ch);
+        const uint8_t* src = buf.data();
+        uint8_t* yp = out.data();
+        uint8_t* up = yp + static_cast<size_t>(width) * height;
+        uint8_t* vp = up + static_cast<size_t>(cw) * ch;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row = src + static_cast<size_t>(y) * width * 4;
+            uint8_t* yrow = yp + static_cast<size_t>(y) * width;
+            for (uint32_t x = 0; x < width; ++x) {
+                const int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
+                int luma = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                yrow[x] = static_cast<uint8_t>(luma < 16 ? 16 : (luma > 235 ? 235 : luma));
+            }
+        }
+        for (uint32_t cy = 0; cy < ch; ++cy) {
+            for (uint32_t cx = 0; cx < cw; ++cx) {
+                int rs = 0, gs = 0, bs = 0;
+                for (uint32_t dy = 0; dy < 2; ++dy) {
+                    const uint8_t* row = src + (static_cast<size_t>(cy) * 2 + dy) * width * 4;
+                    for (uint32_t dx = 0; dx < 2; ++dx) {
+                        const uint32_t x = cx * 2 + dx;
+                        bs += row[x * 4];
+                        gs += row[x * 4 + 1];
+                        rs += row[x * 4 + 2];
+                    }
+                }
+                const int r = (rs + 2) / 4, g = (gs + 2) / 4, b = (bs + 2) / 4;
+                int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+                int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                up[static_cast<size_t>(cy) * cw + cx] = static_cast<uint8_t>(u < 16 ? 16 : (u > 240 ? 240 : u));
+                vp[static_cast<size_t>(cy) * cw + cx] = static_cast<uint8_t>(v < 16 ? 16 : (v > 240 ? 240 : v));
+            }
+        }
+        buf.swap(out);
+        return true;
+    }
     if (format != 1 && format != 2) return false;
     std::vector<uint8_t> converted;
     if (format == 2) {
