@@ -626,6 +626,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
     exports.Set("targetsSupported", Napi::Boolean::New(env, osrcap::TargetsSupported()));
+    exports.Set("maxConcurrentReadbacks", Napi::Number::New(env, static_cast<double>(osrcap::MaxConcurrentReadbacks())));
     exports.Set("videoLayerSupported", Napi::Boolean::New(env, osrcap::VideoLayerSupported()));
 #endif
 #if defined(_WIN32)

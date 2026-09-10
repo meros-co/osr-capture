@@ -1895,6 +1895,7 @@ bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int forma
 }
 
 bool TargetsSupported() { return true; }
+size_t MaxConcurrentReadbacks() { return kMaxPool; }
 
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err) {
     return ReadbackConsume(handle, width, height, format, key, dstW, dstH, std::vector<TargetSpec>(), err);

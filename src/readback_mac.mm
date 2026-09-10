@@ -996,6 +996,9 @@ const char* ReadbackBackend() {
 
 namespace osrcap {
 bool TargetsSupported() { return true; }
+// Metal keys its state per output rather than pooling contexts, so the limit is the command queue's own
+// depth; MTLCommandQueue is created with the default (64) and a readback uses one command buffer.
+size_t MaxConcurrentReadbacks() { return 64; }
 // The video layer is composited in the Metal convert pass (see overVideo in kMetalSource).
 bool VideoLayerSupported() { return true; }
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
