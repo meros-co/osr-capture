@@ -288,6 +288,17 @@ void main() {
 }
 )GLSL";
 
+// The shared scale source. Consumers smaller than the render each box-filtered the whole frame for
+// themselves; this produces one composited downscale at the largest of their sizes, in the SOURCE's own
+// channel order and already un-flipped, so a pass sampling it (with uFlipY and uVideoOn off) behaves
+// exactly as if it were sampling the render.
+const char* kFragShare = R"GLSL(
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    o = PIX(d.x, d.y);
+}
+)GLSL";
+
 // Box-filter downscale to BGRA (same semantics as convert.cc DownscaleBgra / the Windows scale pass).
 const char* kFragScale = R"GLSL(
 void main() {
@@ -438,6 +449,9 @@ struct KeyState {
     int alphaW = 0, alphaH = 0;
     GLuint texScaled = 0, fboScaled = 0;
     int scaledW = 0, scaledH = 0;
+    // the shared scale source (see kFragShare), reused across frames like the other targets
+    GLuint texShare = 0, fboShare = 0;
+    int shareW = 0, shareH = 0;
     // video layer, cached per key (one texture per output: two outputs with differently sized layers must
     // not thrash a single shared allocation). Reallocated only when the texel dimensions change.
     GLuint videoTex = 0;
@@ -578,9 +592,9 @@ private:
     bool CompileProgram(Program& p, const char* fragBody, std::string& err);
     bool EnsureTarget(GLuint& tex, GLuint& fbo, int& curW, int& curH, int w, int h, std::string& err);
     // Packed formats render fewer texels than they describe pixels, so the viewport and uDstSize differ.
-    void DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int dstW, int dstH, GLuint srcTex, int srcW, int srcH);
-    void DrawTo(const Program& p, GLuint fbo, int dstW, int dstH, GLuint srcTex, int srcW, int srcH) {
-        DrawToSized(p, fbo, dstW, dstH, dstW, dstH, srcTex, srcW, srcH);
+    void DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int dstW, int dstH, GLuint srcTex, int srcW, int srcH, bool fromShare = false);
+    void DrawTo(const Program& p, GLuint fbo, int dstW, int dstH, GLuint srcTex, int srcW, int srcH, bool fromShare = false) {
+        DrawToSized(p, fbo, dstW, dstH, dstW, dstH, srcTex, srcW, srcH, fromShare);
     }
     EGLImageKHR ImportDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h, std::string& err);
     void DropPending(KeyState& ks);
@@ -605,7 +619,7 @@ private:
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR_ = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR_ = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
-    Program pUyvy_, pAlpha_, pBgra_, pRgba_, pScale_;
+    Program pUyvy_, pAlpha_, pBgra_, pRgba_, pScale_, pShare_;
     Program pScaleUyvy_, pScaleAlpha_, pScaleRgba_, pI420Luma_, pI420U_, pI420V_;
     std::map<std::string, KeyState> keys_;
     // the layer state DrawToSized binds; set per consume by SetVideoLayerOnThread
@@ -779,7 +793,8 @@ bool GlThread::InitGl() {
     const std::string i420v = std::string(kFragI420ChromaPrelude) + kFragI420V;
     if (!CompileProgram(pUyvy_, kFragUyvy, serr) || !CompileProgram(pAlpha_, kFragAlpha, serr) ||
         !CompileProgram(pBgra_, kFragCopyBgra, serr) || !CompileProgram(pRgba_, kFragCopyRgba, serr) ||
-        !CompileProgram(pScale_, kFragScale, serr) || !CompileProgram(pScaleUyvy_, kFragScaleUyvy, serr) ||
+        !CompileProgram(pScale_, kFragScale, serr) || !CompileProgram(pShare_, kFragShare, serr) ||
+        !CompileProgram(pScaleUyvy_, kFragScaleUyvy, serr) ||
         !CompileProgram(pScaleAlpha_, kFragScaleAlpha, serr) || !CompileProgram(pScaleRgba_, kFragScaleRgba, serr) ||
         !CompileProgram(pI420Luma_, kFragI420Luma, serr) || !CompileProgram(pI420U_, i420u.c_str(), serr) ||
         !CompileProgram(pI420V_, i420v.c_str(), serr)) {
@@ -814,25 +829,27 @@ bool GlThread::EnsureTarget(GLuint& tex, GLuint& fbo, int& curW, int& curH, int 
     return true;
 }
 
-void GlThread::DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int dstW, int dstH, GLuint srcTex, int srcW, int srcH) {
+void GlThread::DrawToSized(const Program& p, GLuint fbo, int vpW, int vpH, int dstW, int dstH, GLuint srcTex, int srcW, int srcH, bool fromShare) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glViewport(0, 0, vpW, vpH);
     glUseProgram(p.id);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, srcTex);
     if (p.uTex >= 0) glUniform1i(p.uTex, 0);
-    if (p.uFlipY >= 0) glUniform1i(p.uFlipY, flipY_);
+    // the shared scale source is already un-flipped and already has the layer composited into it
+    if (p.uFlipY >= 0) glUniform1i(p.uFlipY, fromShare ? 0 : flipY_);
     if (p.uSrcH >= 0) glUniform1i(p.uSrcH, srcH);
     if (p.uSrcSize >= 0) glUniform2i(p.uSrcSize, srcW, srcH);
     if (p.uDstSize >= 0) glUniform2i(p.uDstSize, dstW, dstH);
     // unit 1 is the video layer; leave the active unit back at 0, which the rest of the file assumes.
     // (DummyVideoTex touches the active unit itself, so resolve it BEFORE selecting unit 1.)
-    const GLuint vtex = videoOn_ ? videoTex_ : DummyVideoTex();
+    const bool layer = videoOn_ && !fromShare;
+    const GLuint vtex = layer ? videoTex_ : DummyVideoTex();
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, vtex);
     glActiveTexture(GL_TEXTURE0);
     if (p.uVideo >= 0) glUniform1i(p.uVideo, 1);
-    if (p.uVideoOn >= 0) glUniform1i(p.uVideoOn, videoOn_ ? 1 : 0);
+    if (p.uVideoOn >= 0) glUniform1i(p.uVideoOn, layer ? 1 : 0);
     if (p.uVideoSize >= 0) glUniform2i(p.uVideoSize, videoW_, videoH_);
     if (p.uVideoFormat >= 0) glUniform1i(p.uVideoFormat, videoFormat_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1078,6 +1095,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
         int vpW, vpH, dstW, dstH;
         const Program* prog;
         size_t off;
+        bool share;  // this plane may read the shared scale source
     };
     std::vector<TargetDraw> tdraws;
     for (size_t i = targets.size(); i < ks.targets.size(); ++i) DeleteTargetState(ks.targets[i]);
@@ -1102,7 +1120,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
             pl.rows = (uint32_t)vpH;
             off += (size_t)pl.rowGl * pl.rows;
             ts.layout.nPlanes = idx + 1;
-            tdraws.push_back({ts.fbo[idx], vpW, vpH, tw, th, &pr, pl.off});
+            tdraws.push_back({ts.fbo[idx], vpW, vpH, tw, th, &pr, pl.off, t.format == 0 || t.format == 1 || t.format == 3});
         };
         if (t.format == 1 || t.format == 2) {
             plane(0, tw / 2, th, (uint32_t)tw * 2, pScaleUyvy_);
@@ -1140,12 +1158,45 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     }
 
     // ---- draws (the only stage that READS the dmabuf) ----------------------------------------------------
+    // Consumers smaller than the render each box-filter the whole frame, so two or more of them read the
+    // source two or more times over. Read it once into a shared scale source at the largest of their sizes
+    // and let them filter from that. Packed UYVA and I420 targets keep reading the source directly - their
+    // plane packing is tied to the source layout - so the share only exists when two plain or UYVY
+    // consumers can use it, and when it does not exist nothing below changes.
+    int shareW = 0, shareH = 0, shareUsers = 0;
+    auto canShare = [](int fmt) { return fmt == 0 || fmt == 1 || fmt == 3; };
+    if (wantScaled && (int)dstW < (int)w) {
+        shareUsers++;
+        if ((int)dstW > shareW) { shareW = (int)dstW; shareH = (int)dstH; }
+    }
+    for (const TargetSpec& t : targets) {
+        if (!t.w || (int)t.w >= (int)w || !canShare(t.format)) continue;
+        shareUsers++;
+        if ((int)t.w > shareW) { shareW = (int)t.w; shareH = (int)t.h; }
+    }
+    bool haveShare = false;
+    if (shareUsers >= 2 && shareW > 0 && shareH > 0) {
+        std::string serr;
+        if (EnsureTarget(ks.texShare, ks.fboShare, ks.shareW, ks.shareH, shareW, shareH, serr)) {
+            DrawTo(pShare_, ks.fboShare, shareW, shareH, srcTex, (int)w, (int)h);
+            haveShare = true;
+        }
+    }
+    const GLuint smallTex = haveShare ? ks.texShare : srcTex;
+    const int smallW = haveShare ? shareW : (int)w;
+    const int smallH = haveShare ? shareH : (int)h;
+
     const Program& mainProg = (format == 1 || format == 2) ? pUyvy_ : (format == 3 ? pRgba_ : pBgra_);
     DrawTo(mainProg, ks.fboMain, mainTexW, (int)h, srcTex, (int)w, (int)h);
     if (format == 2) DrawTo(pAlpha_, ks.fboAlpha, (int)alphaTexW, (int)h, srcTex, (int)w, (int)h);
-    if (wantScaled) DrawTo(pScale_, ks.fboScaled, (int)dstW, (int)dstH, srcTex, (int)w, (int)h);
-    for (const TargetDraw& td : tdraws)
-        DrawToSized(*td.prog, td.fbo, td.vpW, td.vpH, td.dstW, td.dstH, srcTex, (int)w, (int)h);
+    if (wantScaled) {
+        const bool viaShare = haveShare && (int)dstW <= smallW && (int)dstH <= smallH;
+        DrawTo(pScale_, ks.fboScaled, (int)dstW, (int)dstH, viaShare ? smallTex : srcTex, viaShare ? smallW : (int)w, viaShare ? smallH : (int)h, viaShare);
+    }
+    for (const TargetDraw& td : tdraws) {
+        const bool viaShare = haveShare && td.share && td.dstW <= smallW && td.dstH <= smallH;
+        DrawToSized(*td.prog, td.fbo, td.vpW, td.vpH, td.dstW, td.dstH, viaShare ? smallTex : srcTex, viaShare ? smallW : (int)w, viaShare ? smallH : (int)h, viaShare);
+    }
     GLsync fenceDraw = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     D().fenceCreated.fetch_add(1);
 
@@ -1261,9 +1312,11 @@ void GlThread::ReleaseKeyOnThread(const std::string& key) {
     if (ks.fboMain) glDeleteFramebuffers(1, &ks.fboMain);
     if (ks.fboAlpha) glDeleteFramebuffers(1, &ks.fboAlpha);
     if (ks.fboScaled) glDeleteFramebuffers(1, &ks.fboScaled);
+    if (ks.fboShare) glDeleteFramebuffers(1, &ks.fboShare);
     if (ks.texMain) glDeleteTextures(1, &ks.texMain);
     if (ks.texAlpha) glDeleteTextures(1, &ks.texAlpha);
     if (ks.texScaled) glDeleteTextures(1, &ks.texScaled);
+    if (ks.texShare) glDeleteTextures(1, &ks.texShare);
     if (ks.videoTex) {
         if (videoTex_ == ks.videoTex) {  // never leave the draw state pointing at a deleted texture
             videoTex_ = 0;

@@ -199,6 +199,20 @@ inline float4 boxAvg(texture2d<float, access::read> src, texture2d<float, access
     return overVideo(acc / float(cnt), vid, p.vid, dx, dy, p.dstW, p.dstH);
 }
 
+// The shared scale source. Consumers smaller than the render each box-filter the whole frame for
+// themselves, so two or more of them read the render two or more times over. This produces one composited
+// downscale at the largest of their sizes, in the render's own channel order, and they box-filter from that
+// instead. Its output is what src would have given them, so the passes below are unchanged apart from
+// which texture they read and having the layer already composited in.
+kernel void shareScale(texture2d<float, access::read> src [[texture(0)]],
+                       texture2d<float, access::read> vid [[texture(1)]],
+                       texture2d<float, access::write> out [[texture(2)]],
+                       constant ScParams& p [[buffer(1)]],
+                       uint2 tid [[thread_position_in_grid]]) {
+    if (tid.x >= p.dstW || tid.y >= p.dstH) return;
+    out.write(boxAvg(src, vid, p, tid.x, tid.y), tid);
+}
+
 // formats 0 (BGRA), 1 (UYVY), 2 (UYVA), 3 (RGBA). Two destination pixels per thread, as on Windows, so the
 // UYVY store is one aligned word.
 kernel void scaleConvert(texture2d<float, access::read> src [[texture(0)]],
@@ -343,6 +357,10 @@ struct MetalCtx {
     id<MTLComputePipelineState> psoSwizzle = nil;
     id<MTLComputePipelineState> psoScaleConvert = nil;
     id<MTLComputePipelineState> psoScaleI420 = nil;
+    id<MTLComputePipelineState> psoShare = nil;
+    // the shared scale source, reallocated only when the size it needs changes
+    id<MTLTexture> shareTex = nil;
+    uint32_t shareW = 0, shareH = 0;
     // Bound at texture(1) whenever a pass has no video layer, so the slot is always valid (the kernels
     // never read it in that case — overVideo returns before the load).
     id<MTLTexture> dummyVideo = nil;
@@ -386,6 +404,7 @@ MetalCtx& Ctx() {
             ctx.psoDownscale = pso("downscaleBgra");
             ctx.psoSwizzle = pso("swizzleRgba");
             ctx.psoScaleConvert = pso("scaleConvert");
+            ctx.psoShare = pso("shareScale");
             ctx.psoScaleI420 = pso("scaleI420");
             // An IOSurface-backed texture must use Shared storage on unified-memory (Apple Silicon) devices
             // and Managed on discrete/Intel ones. The same rule applies to the CPU-written video layer.
@@ -597,11 +616,53 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
             [blit endEncoding];
         }
 
+        // Read the render once for every consumer smaller than it. Packed UYVA and I420 targets keep
+        // reading it directly - their plane packing is tied to the source layout - so the shared source
+        // only exists when two consumers that can use it are present, and when it does not, every pass
+        // below reads `tex` exactly as before.
+        uint32_t shareW = 0, shareH = 0;
+        int shareUsers = 0;
+        if (scaledBuf && dstW > 0 && dstH > 0 && dstW < width) {
+            shareUsers++;
+            if (dstW > shareW) { shareW = dstW; shareH = dstH; }
+        }
+        for (const TargetSpec& t : targets) {
+            if (!t.w || t.w >= width || !(t.format == 0 || t.format == 1 || t.format == 3)) continue;
+            shareUsers++;
+            if (t.w > shareW) { shareW = t.w; shareH = t.h; }
+        }
+        id<MTLTexture> shareTex = nil;
+        if (shareUsers >= 2 && shareW > 0 && shareH > 0 && ctx.psoShare) {
+            if (!ctx.shareTex || ctx.shareW != shareW || ctx.shareH != shareH) {
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:shareW height:shareH mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                td.storageMode = MTLStorageModePrivate;
+                ctx.shareTex = [ctx.device newTextureWithDescriptor:td];
+                ctx.shareW = ctx.shareTex ? shareW : 0;
+                ctx.shareH = ctx.shareTex ? shareH : 0;
+            }
+            if (ctx.shareTex) {
+                ScParams p{width, height, shareW, shareH, 0, 0, vid};
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:ctx.psoShare];
+                [enc setTexture:tex atIndex:0];
+                [enc setTexture:vidTex atIndex:1];
+                [enc setTexture:ctx.shareTex atIndex:2];
+                [enc setBytes:&p length:sizeof(p) atIndex:1];
+                [enc dispatchThreads:MTLSizeMake(shareW, shareH, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                [enc endEncoding];
+                shareTex = ctx.shareTex;
+            }
+        }
+        // a pass reading the shared source must not composite the layer a second time
+        const VidParams vidOff{0, 0, 0, 0};
+
         if (scaledBuf && dstW > 0 && dstH > 0) {
-            DsParams p{width, height, dstW, dstH, vid};
+            const bool viaShare = shareTex && dstW <= shareW && dstH <= shareH;
+            DsParams p{viaShare ? shareW : width, viaShare ? shareH : height, dstW, dstH, viaShare ? vidOff : vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:ctx.psoDownscale];
-            [enc setTexture:tex atIndex:0];
+            [enc setTexture:(viaShare ? shareTex : tex) atIndex:0];
             [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:scaledBuf offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
@@ -614,11 +675,13 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
         for (size_t i = 0; i < targets.size() && i < targetBufs.size(); ++i) {
             const TargetSpec& t = targets[i];
             if (!t.w || !t.h || !targetBufs[i]) continue;
-            ScParams p{width, height, t.w, t.h, static_cast<uint32_t>(t.format), t.w * 2 * t.h, vid};
+            const bool canShare = (t.format == 0 || t.format == 1 || t.format == 3);
+            const bool viaShare = shareTex && canShare && t.w <= shareW && t.h <= shareH;
+            ScParams p{viaShare ? shareW : width, viaShare ? shareH : height, t.w, t.h, static_cast<uint32_t>(t.format), t.w * 2 * t.h, viaShare ? vidOff : vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             const bool i420 = (t.format == 4);
             [enc setComputePipelineState:(i420 ? ctx.psoScaleI420 : ctx.psoScaleConvert)];
-            [enc setTexture:tex atIndex:0];
+            [enc setTexture:(viaShare ? shareTex : tex) atIndex:0];
             [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:targetBufs[i] offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
