@@ -7,6 +7,8 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <atomic>
+#include <memory>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -24,8 +26,10 @@ struct Mapping {
     void* ptr = nullptr;
     size_t size = 0;
     bool owner = false;
-    int inflight = 0;          // async copies using ptr (JS-thread bookkeeping)
-    bool unmapRequested = false; // shmUnmap while copies were in flight: unmap when the last one lands
+    // copies currently reading or writing ptr, from any thread. A copy holds a reference for its whole
+    // duration, so the region cannot be released underneath it and no lock need be held while it runs.
+    std::atomic<int> inflight{0};
+    std::atomic<bool> unmapRequested{false};  // shmUnmap during copies: release when the last one lands
 #if defined(_WIN32)
     HANDLE handle = nullptr;
 #else
@@ -33,7 +37,10 @@ struct Mapping {
 #endif
 };
 
-std::unordered_map<std::string, Mapping> g_maps;
+// The mutex guards the TABLE (find/insert/erase), never a copy. Holding it across a memcpy made every
+// ring in the process wait behind whichever one was copying - at 4K that is a 33MB copy per frame per
+// output. Mappings are held by pointer so an entry keeps its address when the table rehashes.
+std::unordered_map<std::string, std::unique_ptr<Mapping>> g_maps;
 std::mutex g_mapsMutex;
 
 #if defined(_WIN32)
@@ -83,7 +90,14 @@ void UnmapRegion(const std::string& name, Mapping& m) {
     if (m.fd >= 0) close(m.fd);
     if (m.owner) shm_unlink(("/" + name).c_str());
 #endif
-    m = Mapping();
+    m.ptr = nullptr;
+    m.size = 0;
+    m.owner = false;
+#if defined(_WIN32)
+    m.handle = nullptr;
+#else
+    m.fd = -1;
+#endif
 }
 
 // shmMap(name, bytes, create) -> true. The same name maps the same memory in every process; a name
@@ -110,9 +124,18 @@ Napi::Value ShmMap(const Napi::CallbackInfo& info) {
             Napi::Error::New(env, "shmMap: " + err).ThrowAsJavaScriptException();
             return env.Undefined();
         }
-        it = g_maps.emplace(name, m).first;
+        auto entry = std::make_unique<Mapping>();
+        entry->ptr = m.ptr;
+        entry->size = m.size;
+        entry->owner = m.owner;
+#if defined(_WIN32)
+        entry->handle = m.handle;
+#else
+        entry->fd = m.fd;
+#endif
+        it = g_maps.emplace(name, std::move(entry)).first;
     }
-    Mapping& m = it->second;
+    Mapping& m = *it->second;
     if (m.unmapRequested) {
         Napi::Error::New(env, "shmMap: mapping is being released").ThrowAsJavaScriptException();
         return env.Undefined();
@@ -124,8 +147,10 @@ Napi::Value ShmMap(const Napi::CallbackInfo& info) {
     return Napi::Boolean::New(env, true);
 }
 
-// resolves (name, offset, view) to the mapped byte range; throws on a bad range
-static bool ResolveRange(const Napi::CallbackInfo& info, const char* fn, uint8_t** base, uint8_t** js, size_t* len) {
+// Resolves (name, offset, view) to the mapped byte range and takes a reference on the mapping, so the
+// copy that follows can run with no lock held and the region cannot be released underneath it. Throws
+// on a bad range, in which case no reference is taken.
+static bool AcquireRange(const Napi::CallbackInfo& info, const char* fn, Mapping** mapping, uint8_t** base, uint8_t** js, size_t* len) {
     Napi::Env env = info.Env();
     if (info.Length() < 3 || !info[0].IsString() || !info[1].IsNumber() || !info[2].IsTypedArray()) {
         Napi::TypeError::New(env, std::string(fn) + "(name, offset, bytes: Uint8Array)").ThrowAsJavaScriptException();
@@ -135,36 +160,57 @@ static bool ResolveRange(const Napi::CallbackInfo& info, const char* fn, uint8_t
     int64_t offset = info[1].As<Napi::Number>().Int64Value();
     Napi::TypedArray ta = info[2].As<Napi::TypedArray>();
     size_t bytes = ta.ByteLength();
+
+    std::lock_guard<std::mutex> lock(g_mapsMutex);
     auto it = g_maps.find(name);
     if (it == g_maps.end()) {
         Napi::Error::New(env, std::string(fn) + ": not mapped").ThrowAsJavaScriptException();
         return false;
     }
-    if (offset < 0 || (uint64_t)offset + bytes > it->second.size) {
+    Mapping* m = it->second.get();
+    if (m->unmapRequested.load()) {
+        Napi::Error::New(env, std::string(fn) + ": mapping is being released").ThrowAsJavaScriptException();
+        return false;
+    }
+    if (offset < 0 || (uint64_t)offset + bytes > m->size) {
         Napi::RangeError::New(env, std::string(fn) + ": range outside the mapping").ThrowAsJavaScriptException();
         return false;
     }
-    *base = (uint8_t*)it->second.ptr + offset;
+    m->inflight.fetch_add(1);
+    *mapping = m;
+    *base = (uint8_t*)m->ptr + offset;
     *js = (uint8_t*)ta.ArrayBuffer().Data() + ta.ByteOffset();
     *len = bytes;
     return true;
 }
 
+// Drop a reference taken by AcquireRange, releasing the region if an unmap was waiting on it.
+static void ReleaseRange(const std::string& name, Mapping* m) {
+    if (m->inflight.fetch_sub(1) != 1) return;
+    if (!m->unmapRequested.load()) return;
+    std::lock_guard<std::mutex> lock(g_mapsMutex);
+    auto it = g_maps.find(name);
+    if (it == g_maps.end() || it->second.get() != m) return;
+    if (m->inflight.load() != 0) return;  // another copy started while we were taking the lock
+    UnmapRegion(name, *m);
+    g_maps.erase(it);
+}
+
 // shmWrite(name, offset, bytes): copy a JS buffer into the mapping at offset
 Napi::Value ShmWrite(const Napi::CallbackInfo& info) {
-    std::lock_guard<std::mutex> lock(g_mapsMutex);
-    uint8_t* base; uint8_t* js; size_t len;
-    if (!ResolveRange(info, "shmWrite", &base, &js, &len)) return info.Env().Undefined();
+    Mapping* m; uint8_t* base; uint8_t* js; size_t len;
+    if (!AcquireRange(info, "shmWrite", &m, &base, &js, &len)) return info.Env().Undefined();
     memcpy(base, js, len);
+    ReleaseRange(info[0].As<Napi::String>().Utf8Value(), m);
     return Napi::Number::New(info.Env(), (double)len);
 }
 
 // shmRead(name, offset, bytes): fill a JS buffer from the mapping at offset
 Napi::Value ShmRead(const Napi::CallbackInfo& info) {
-    std::lock_guard<std::mutex> lock(g_mapsMutex);
-    uint8_t* base; uint8_t* js; size_t len;
-    if (!ResolveRange(info, "shmRead", &base, &js, &len)) return info.Env().Undefined();
+    Mapping* m; uint8_t* base; uint8_t* js; size_t len;
+    if (!AcquireRange(info, "shmRead", &m, &base, &js, &len)) return info.Env().Undefined();
     memcpy(js, base, len);
+    ReleaseRange(info[0].As<Napi::String>().Utf8Value(), m);
     return Napi::Number::New(info.Env(), (double)len);
 }
 
@@ -173,8 +219,8 @@ Napi::Value ShmRead(const Napi::CallbackInfo& info) {
 // (shmUnmap defers until in-flight copies land).
 class ShmCopyWorker : public Napi::AsyncWorker {
 public:
-    ShmCopyWorker(Napi::Env env, const std::string& name, uint8_t* base, Napi::Value js, uint8_t* jsPtr, size_t len, bool write)
-        : Napi::AsyncWorker(env), deferred_(Napi::Promise::Deferred::New(env)), name_(name), base_(base), jsPtr_(jsPtr), len_(len), write_(write) {
+    ShmCopyWorker(Napi::Env env, const std::string& name, Mapping* mapping, uint8_t* base, Napi::Value js, uint8_t* jsPtr, size_t len, bool write)
+        : Napi::AsyncWorker(env), deferred_(Napi::Promise::Deferred::New(env)), name_(name), mapping_(mapping), base_(base), jsPtr_(jsPtr), len_(len), write_(write) {
         ref_ = Napi::Persistent(js.As<Napi::Object>());
     }
     Napi::Promise GetPromise() { return deferred_.Promise(); }
@@ -183,27 +229,18 @@ public:
         else memcpy(jsPtr_, base_, len_);
     }
     void OnOK() override {
-        Done();
+        ReleaseRange(name_, mapping_);
         deferred_.Resolve(Napi::Number::New(Env(), (double)len_));
     }
     void OnError(const Napi::Error& e) override {
-        Done();
+        ReleaseRange(name_, mapping_);
         deferred_.Reject(e.Value());
     }
 
 private:
-    void Done() {
-        std::lock_guard<std::mutex> lock(g_mapsMutex);
-        auto it = g_maps.find(name_);
-        if (it == g_maps.end()) return;
-        it->second.inflight--;
-        if (it->second.inflight == 0 && it->second.unmapRequested) {
-            UnmapRegion(name_, it->second);
-            g_maps.erase(it);
-        }
-    }
     Napi::Promise::Deferred deferred_;
     std::string name_;
+    Mapping* mapping_;
     uint8_t* base_;
     uint8_t* jsPtr_;
     size_t len_;
@@ -213,17 +250,10 @@ private:
 
 static Napi::Value ShmCopyAsync(const Napi::CallbackInfo& info, bool write) {
     Napi::Env env = info.Env();
-    std::lock_guard<std::mutex> lock(g_mapsMutex);
-    uint8_t* base; uint8_t* js; size_t len;
-    if (!ResolveRange(info, write ? "shmWriteAsync" : "shmReadAsync", &base, &js, &len)) return env.Undefined();
+    Mapping* m; uint8_t* base; uint8_t* js; size_t len;
+    if (!AcquireRange(info, write ? "shmWriteAsync" : "shmReadAsync", &m, &base, &js, &len)) return env.Undefined();
     std::string name = info[0].As<Napi::String>().Utf8Value();
-    auto it = g_maps.find(name);
-    if (it->second.unmapRequested) {
-        Napi::Error::New(env, "shm: mapping is being released").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    it->second.inflight++;
-    auto* worker = new ShmCopyWorker(env, name, base, info[2], js, len, write);
+    auto* worker = new ShmCopyWorker(env, name, m, base, info[2], js, len, write);
     worker->Queue();
     return worker->GetPromise();
 }
@@ -242,11 +272,11 @@ Napi::Value ShmUnmap(const Napi::CallbackInfo& info) {
     std::lock_guard<std::mutex> lock(g_mapsMutex);
     auto it = g_maps.find(name);
     if (it == g_maps.end()) return Napi::Boolean::New(env, false);
-    if (it->second.inflight > 0) {
-        it->second.unmapRequested = true;
-        return Napi::Boolean::New(env, true);
-    }
-    UnmapRegion(name, it->second);
+    Mapping* m = it->second.get();
+    // a copy holds a reference for its whole duration: mark the region and let the last one release it
+    m->unmapRequested.store(true);
+    if (m->inflight.load() > 0) return Napi::Boolean::New(env, true);
+    UnmapRegion(name, *m);
     g_maps.erase(it);
     return Napi::Boolean::New(env, true);
 }
