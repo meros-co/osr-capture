@@ -546,11 +546,18 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
     if (px >= gDstW || y >= gDstH) return;
     float4 c0 = overVideo(boxAvg(px, y), px, y, gDstW, gDstH);
     float4 c1 = (px + 1 < gDstW) ? overVideo(boxAvg(px + 1, y), px + 1, y, gDstW, gDstH) : c0;
-    if (gFormat == 0) {
-        uint w0 = (uint)toByte(c0.b) | ((uint)toByte(c0.g) << 8) | ((uint)toByte(c0.r) << 16) | ((uint)toByte(c0.a) << 24);
+    // 0 = BGRA and 3 = RGBA are the same four bytes per pixel in a different order. Anything that is not
+    // one of them is a packed format, handled below - a format with no branch here must never fall into
+    // that, or it is written at half the stride and read back as two rows side by side.
+    if (gFormat == 0 || gFormat == 3) {
+        uint b0 = (uint)toByte(gFormat == 0 ? c0.b : c0.r);
+        uint r0 = (uint)toByte(gFormat == 0 ? c0.r : c0.b);
+        uint w0 = b0 | ((uint)toByte(c0.g) << 8) | (r0 << 16) | ((uint)toByte(c0.a) << 24);
         gDst.Store((y * gDstW + px) * 4, w0);
         if (px + 1 < gDstW) {
-            uint w1 = (uint)toByte(c1.b) | ((uint)toByte(c1.g) << 8) | ((uint)toByte(c1.r) << 16) | ((uint)toByte(c1.a) << 24);
+            uint b1 = (uint)toByte(gFormat == 0 ? c1.b : c1.r);
+            uint r1c = (uint)toByte(gFormat == 0 ? c1.r : c1.b);
+            uint w1 = b1 | ((uint)toByte(c1.g) << 8) | (r1c << 16) | ((uint)toByte(c1.a) << 24);
             gDst.Store((y * gDstW + px + 1) * 4, w1);
         }
         return;
