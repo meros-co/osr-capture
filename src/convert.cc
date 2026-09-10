@@ -213,7 +213,23 @@ Napi::Value DownscaleBgra(const Napi::CallbackInfo& info) {
     return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
 }
 
+// planar I420 for the RTMP encoder, for the rare frame no GPU pass produced one for
+Napi::Value ConvertBgraToI420(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
+    uint32_t width = info[1].As<Napi::Number>().Uint32Value();
+    uint32_t height = info[2].As<Napi::Number>().Uint32Value();
+
+    std::vector<uint8_t> buf(src.Data(), src.Data() + src.ByteLength());
+    if (!ConvertBgraInPlace(buf, width, height, 4)) {
+        Napi::Error::New(env, "convertBgraToI420 failed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    return Napi::Buffer<uint8_t>::Copy(env, buf.data(), buf.size());
+}
+
 void RegisterConvert(Napi::Env env, Napi::Object exports) {
+    exports.Set("convertBgraToI420", Napi::Function::New(env, ConvertBgraToI420));
     exports.Set("convertBgraToUyvy", Napi::Function::New(env, ConvertBgraToUyvy));
     exports.Set("convertBgraToUyva", Napi::Function::New(env, ConvertBgraToUyva));
     exports.Set("downscaleBgra", Napi::Function::New(env, DownscaleBgra));

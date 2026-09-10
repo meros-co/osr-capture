@@ -34,7 +34,9 @@ namespace osrcap {
 namespace {
 
 // ---------------------------------------------------------------------------------------------------------
-// Metal kernels. Ported 1:1 from the Windows HLSL (readback_win.cc kConvertHLSL / kDownscaleHLSL /
+// Metal kernels. Widths that are merely even (not a multiple of 4) are handled here rather than being
+// pushed to the CPU path, because display scaling produces them routinely.
+// Ported 1:1 from the Windows HLSL (readback_win.cc kConvertHLSL / kDownscaleHLSL /
 // kSwizzleHLSL) so all three platforms produce the same bytes for the same frame. toByte() recovers the exact
 // source byte: a BGRA8Unorm texel reads back as byte/255.0, so byte/255.0*255.0 + 0.5 truncates to `byte`.
 const char* kMetalSource = R"MSL(
@@ -90,10 +92,11 @@ kernel void convertUyvy(texture2d<float, access::read> src [[texture(0)]],
     uint y = tid.y;
     if (px >= p.width || y >= p.height) return;
 
-    float4 c0 = overVideo(src.read(uint2(px + 0, y)), vid, p.vid, px + 0, y, p.width, p.height);
-    float4 c1 = overVideo(src.read(uint2(px + 1, y)), vid, p.vid, px + 1, y, p.width, p.height);
-    float4 c2 = overVideo(src.read(uint2(px + 2, y)), vid, p.vid, px + 2, y, p.width, p.height);
-    float4 c3 = overVideo(src.read(uint2(px + 3, y)), vid, p.vid, px + 3, y, p.width, p.height);
+    uint last = p.width - 1;
+    float4 c0 = overVideo(src.read(uint2(min(px + 0, last), y)), vid, p.vid, min(px + 0, last), y, p.width, p.height);
+    float4 c1 = overVideo(src.read(uint2(min(px + 1, last), y)), vid, p.vid, min(px + 1, last), y, p.width, p.height);
+    float4 c2 = overVideo(src.read(uint2(min(px + 2, last), y)), vid, p.vid, min(px + 2, last), y, p.width, p.height);
+    float4 c3 = overVideo(src.read(uint2(min(px + 3, last), y)), vid, p.vid, min(px + 3, last), y, p.width, p.height);
 
     int r0 = toByte(c0.r), g0 = toByte(c0.g), b0 = toByte(c0.b);
     int r1 = toByte(c1.r), g1 = toByte(c1.g), b1 = toByte(c1.b);
@@ -113,11 +116,18 @@ kernel void convertUyvy(texture2d<float, access::read> src [[texture(0)]],
     uint word1 = uint(u23) | (uint(y2) << 8) | (uint(v23) << 16) | (uint(y3) << 24);
     uint base = (y * p.width * 2 + tid.x * 8) >> 2;  // byte offset -> uint index
     dst[base] = word0;
-    dst[base + 1] = word1;
+    // a row whose width is not a multiple of 4 ends on a thread that owns only the first pair
+    if (px + 2 < p.width) dst[base + 1] = word1;
 
     if (p.writeAlpha != 0) {
-        uint aword = uint(toByte(c0.a)) | (uint(toByte(c1.a)) << 8) | (uint(toByte(c2.a)) << 16) | (uint(toByte(c3.a)) << 24);
-        dst[(p.uyvySize + y * p.width + tid.x * 4) >> 2] = aword;
+        // written a byte at a time so a partial group cannot spill into the next row: the alpha plane
+        // stays tightly packed at one byte per pixel, the same layout the other backends produce
+        device uchar* alpha = (device uchar*)dst + p.uyvySize + y * p.width;
+        float4 av[4] = {c0, c1, c2, c3};
+        for (uint i = 0; i < 4; ++i) {
+            if (px + i >= p.width) break;
+            alpha[px + i] = uchar(toByte(av[i].a));
+        }
     }
 }
 
@@ -407,7 +417,7 @@ MetalCtx& Ctx() {
 // Windows). Every real output resolution satisfies this; anything else falls back to the CPU converter.
 bool GpuUsable(IOSurfaceRef surface, uint32_t width, uint32_t height) {
     if (!surface || width == 0 || height == 0) return false;
-    if (width % 4 != 0) return false;
+    if (width % 2 != 0) return false;
     if (IOSurfaceGetPixelFormat(surface) != 'BGRA') return false;
     if (IOSurfaceGetWidth(surface) < width || IOSurfaceGetHeight(surface) < height) return false;
     return Ctx().ok;
