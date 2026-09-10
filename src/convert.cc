@@ -17,6 +17,13 @@ namespace osrcap {
 
 namespace {
 
+// JavaScript stores a double into a byte array by clamping then truncating toward zero; this matches it
+inline uint8_t clampd(double v) {
+    if (!(v > 0.0)) return 0;
+    if (v > 255.0) return 255;
+    return static_cast<uint8_t>(v);
+}
+
 inline uint8_t clamp8(int v) {
     return v < 0 ? 0 : (v > 255 ? 255 : static_cast<uint8_t>(v));
 }
@@ -262,7 +269,96 @@ Napi::Value ConvertBgraToI420(const Napi::CallbackInfo& info) {
     return ConvertInto(info, 4);
 }
 
+// previewFrame(src, xres, yres, format, maxWidth) -> { data, width, height }
+//
+// The small RGBA copy the app window draws of an incoming NDI/OMT/Blackmagic stream. This ran as a
+// per-pixel JavaScript loop with floating-point YUV maths in the receive process, once per frame per
+// source. Point-sampled, not filtered, and BT.709 above SD heights - the same result the JS loop gave,
+// which is what makes it a drop-in replacement. format: 0 = bgra, 1 = uyvy, 3 = rgba.
+Napi::Value PreviewFrame(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 5 || !info[0].IsBuffer()) {
+        Napi::TypeError::New(env, "previewFrame(src, xres, yres, format, maxWidth)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    Napi::Buffer<uint8_t> srcBuf = info[0].As<Napi::Buffer<uint8_t>>();
+    const uint32_t xres = info[1].As<Napi::Number>().Uint32Value();
+    const uint32_t yres = info[2].As<Napi::Number>().Uint32Value();
+    const int format = info[3].As<Napi::Number>().Int32Value();
+    const uint32_t maxWidth = info[4].As<Napi::Number>().Uint32Value();
+    if (!xres || !yres || !maxWidth) {
+        Napi::RangeError::New(env, "previewFrame: zero dimension").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    uint32_t scale = (xres + maxWidth - 1) / maxWidth;
+    if (scale < 1) scale = 1;
+    const uint32_t width = xres / scale;
+    const uint32_t height = yres / scale;
+    if (!width || !height) {
+        Napi::RangeError::New(env, "previewFrame: empty result").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    const size_t need = format == 1 ? (size_t)xres * 2 * yres : (size_t)xres * 4 * yres;
+    if (srcBuf.ByteLength() < need) {
+        Napi::RangeError::New(env, "previewFrame: source shorter than its dimensions").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::New(env, (size_t)width * height * 4);
+    const uint8_t* src = srcBuf.Data();
+    uint8_t* dst = out.Data();
+
+    if (format == 1) {
+        // BT.709 above SD heights, matching what the capture libraries auto-detect. Kept in double so the
+        // result is byte-for-byte what the JavaScript loop this replaces produced.
+        const bool bt709 = yres >= 720;
+        const double kr = bt709 ? 1.5748 : 1.402;
+        const double kb = bt709 ? 1.8556 : 1.772;
+        const double gu = bt709 ? 0.1873 : 0.344136;
+        const double gv = bt709 ? 0.4681 : 0.714136;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row = src + (size_t)(y * scale) * xres * 2;
+            uint8_t* o = dst + (size_t)y * width * 4;
+            for (uint32_t x = 0; x < width; ++x, o += 4) {
+                const uint32_t sx = x * scale;
+                const uint32_t pair = sx - (sx % 2);
+                const uint8_t* i = row + (size_t)pair * 2;
+                const double luma = ((sx % 2 == 0 ? i[1] : i[3]) - 16) / 219.0;
+                const double u = (i[0] - 128) / 224.0;
+                const double v = (i[2] - 128) / 224.0;
+                o[0] = clampd((luma + kr * v) * 255.0);
+                o[1] = clampd((luma - gu * u - gv * v) * 255.0);
+                o[2] = clampd((luma + kb * u) * 255.0);
+                o[3] = 255;
+            }
+        }
+    } else {
+        const int r = format == 0 ? 2 : 0;  // bgra reads red from byte 2
+        const int b = format == 0 ? 0 : 2;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* row = src + (size_t)(y * scale) * xres * 4;
+            uint8_t* o = dst + (size_t)y * width * 4;
+            for (uint32_t x = 0; x < width; ++x, o += 4) {
+                const uint8_t* i = row + (size_t)(x * scale) * 4;
+                o[0] = i[r];
+                o[1] = i[1];
+                o[2] = i[b];
+                o[3] = 255;
+            }
+        }
+    }
+
+    Napi::Object result = Napi::Object::New(env);
+    result.Set("data", out);
+    result.Set("width", Napi::Number::New(env, width));
+    result.Set("height", Napi::Number::New(env, height));
+    return result;
+}
+
 void RegisterConvert(Napi::Env env, Napi::Object exports) {
+    exports.Set("previewFrame", Napi::Function::New(env, PreviewFrame));
     exports.Set("convertBgraToI420", Napi::Function::New(env, ConvertBgraToI420));
     exports.Set("convertBgraToUyvy", Napi::Function::New(env, ConvertBgraToUyvy));
     exports.Set("convertBgraToUyva", Napi::Function::New(env, ConvertBgraToUyva));
