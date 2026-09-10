@@ -579,6 +579,60 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
 }
 )HLSL";
 
+// The shared scale source. Every consumer smaller than the render used to box-filter the FULL frame for
+// itself, so N small consumers read the 4K source N times. This produces one intermediate at the largest
+// of their sizes - compositing the video layer as it goes, once - and they sample that instead. It reuses
+// the same box filter and the same compositing as the per-target shader, so a target fed from here is the
+// same image it would have produced itself, filtered in two steps rather than one.
+const char* kScaleSourceHLSL = R"HLSL(
+Texture2D<float4> gSrc : register(t0);
+RWTexture2D<float4> gOut : register(u0);
+cbuffer ScParams : register(b0) {
+    uint gSrcW; uint gSrcH; uint gDstW; uint gDstH;
+    uint gFormat; uint gUyvySize; uint gPad0; uint gPad1;
+    uint gVideoOn; uint gVideoW; uint gVideoH; uint gVideoFormat;
+};
+Texture2D<float4> gVideo : register(t1);
+float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
+    uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
+    uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
+    float4 s = gVideo.Load(int3(vx / 2, vy, 0));
+    float luma = ((vx & 1) == 0) ? s.g : s.a;
+    float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
+    float bt = (gVideoH >= 720) ? 1.0 : 0.0;
+    float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
+    float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
+    return saturate(float3(yy + kr * v, yy - gu * u - gv * v, yy + kb * u));
+}
+float4 overVideo(float4 page, uint x, uint y, uint dstW, uint dstH) {
+    if (gVideoOn == 0) return page;
+    if (page.a >= 0.999) return page;
+    return float4(page.rgb + videoAt(x, y, dstW, dstH) * (1.0 - page.a), 1.0);
+}
+float4 boxAvg(uint dx, uint dy) {
+    if (gSrcW == gDstW && gSrcH == gDstH) return gSrc.Load(int3(dx, dy, 0));
+    uint sx0 = dx * gSrcW / gDstW;
+    uint sx1 = (dx + 1) * gSrcW / gDstW; if (sx1 <= sx0) sx1 = sx0 + 1;
+    uint sy0 = dy * gSrcH / gDstH;
+    uint sy1 = (dy + 1) * gSrcH / gDstH; if (sy1 <= sy0) sy1 = sy0 + 1;
+    float4 acc = float4(0, 0, 0, 0);
+    uint cnt = 0;
+    for (uint y = sy0; y < sy1; ++y) {
+        for (uint x = sx0; x < sx1; ++x) { acc += gSrc.Load(int3(x, y, 0)); ++cnt; }
+    }
+    return acc / cnt;
+}
+[numthreads(8, 8, 1)]
+void SSMain(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= gDstW || tid.y >= gDstH) return;
+    gOut[uint2(tid.x, tid.y)] = overVideo(boxAvg(tid.x, tid.y), tid.x, tid.y, gDstW, gDstH);
+}
+)HLSL";
+
 // I420 (planar 4:2:0, BT.601 limited range) target: one thread per 8x2 block writes two Y words per row
 // and one U + one V word (4 chroma samples), so every store is a whole 32-bit word. Widths that are not
 // multiples of 8 keep their trailing partial words unwritten (guarded), which the caller sizes to avoid.
@@ -775,6 +829,14 @@ struct ReadbackContext {
     size_t outBufSize = 0;
 
     // GPU-downscale (server/stage) path: its own shader + output buffer/staging
+    // shared scale source (see kScaleSourceHLSL)
+    ComPtr<ID3D11ComputeShader> ssShader;
+    ComPtr<ID3D11Texture2D> ssTex;
+    ComPtr<ID3D11UnorderedAccessView> ssUav;
+    ComPtr<ID3D11ShaderResourceView> ssSrv;
+    uint32_t ssW = 0, ssH = 0;
+    bool ssReady = false;  // built for THIS frame
+
     ComPtr<ID3D11ComputeShader> dsShader;
     ComPtr<ID3D11Buffer> dsParamsCb;
     ComPtr<ID3D11Buffer> dsOutBuf;
@@ -857,6 +919,12 @@ struct ReadbackContext {
         outUav.Reset();
         outStaging.Reset();
         outBufSize = 0;
+        ssShader.Reset();
+        ssTex.Reset();
+        ssUav.Reset();
+        ssSrv.Reset();
+        ssW = ssH = 0;
+        ssReady = false;
         dsShader.Reset();
         dsParamsCb.Reset();
         dsOutBuf.Reset();
@@ -1284,15 +1352,11 @@ struct ReadbackContext {
         // 4-byte raw stores: round the buffer up so the last alpha word of a UYVA target fits
         size_t bytes = (osrcap::TargetBytes(t) + 3) & ~(size_t)3;
         if (!EnsureTargetSlot(slot, bytes)) { err = "target buffer creation failed"; return false; }
-        ComPtr<ID3D11ShaderResourceView> srv;
-        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
-        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sv.Texture2D.MipLevels = 1;
-        if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "target SRV creation failed"; return false; }
-        ScParams p{ srcW, srcH, t.w, t.h, (uint32_t)t.format, (uint32_t)((size_t)t.w * 2 * t.h), 0, 0, videoOn ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
+        ScaleSrc src;
+        if (!PickScaleSrc(shared, srcW, srcH, t.w, t.h, src, err)) return false;
+        ScParams p{ src.w, src.h, t.w, t.h, (uint32_t)t.format, (uint32_t)((size_t)t.w * 2 * t.h), 0, 0, (videoOn && !src.composited) ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
         context->UpdateSubresource(scParamsCb.Get(), 0, nullptr, &p, 0, 0);
-        ID3D11ShaderResourceView* srvs[] = { srv.Get(), VideoSrv() };
+        ID3D11ShaderResourceView* srvs[] = { src.srv, VideoSrv() };
         ID3D11UnorderedAccessView* uavs[] = { slot.uav.Get() };
         ID3D11Buffer* cbs[] = { scParamsCb.Get() };
         const bool i420 = t.format == 4;
@@ -1311,20 +1375,99 @@ struct ReadbackContext {
         return true;
     }
 
-    // GPU box-downscale `shared` (BGRA) -> dsOutStaging (small tightly-packed BGRA). Queues GPU work only;
-    // the caller's WaitGpu() covers completion, and ReadPending() maps dsOutStaging out.
-    bool DownscaleToStaging(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::string& err) {
-        if (!EnsureDsShader()) { err = "downscale shader init failed"; return false; }
-        if (!EnsureDsOutBuffer((size_t)dstW * dstH * 4)) { err = "downscale output buffer creation failed"; return false; }
+    // The texture a downscaling pass should read: this frame's shared scale source when it exists and is
+    // still at least as large as what is being produced, else the render itself. The scale source already
+    // has the video layer composited into it, so a pass reading it must not composite again.
+    struct ScaleSrc {
+        ComPtr<ID3D11ShaderResourceView> own;
+        ID3D11ShaderResourceView* srv = nullptr;
+        uint32_t w = 0, h = 0;
+        bool composited = false;
+    };
+    bool PickScaleSrc(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, ScaleSrc& out, std::string& err) {
+        if (ssReady && ssSrv && ssW >= dstW && ssH >= dstH && (ssW != srcW || ssH != srcH)) {
+            out.srv = ssSrv.Get();
+            out.w = ssW;
+            out.h = ssH;
+            out.composited = true;
+            return true;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(shared, &sv, &out.own))) { err = "target SRV creation failed"; return false; }
+        out.srv = out.own.Get();
+        out.w = srcW;
+        out.h = srcH;
+        out.composited = false;
+        return true;
+    }
+
+    // Build the shared scale source for this frame: one composited box-downscale of `shared` that every
+    // smaller consumer then samples. Returns false to mean "carry on reading the full source directly".
+    bool BuildScaleSource(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::string& err) {
+        if (!dstW || !dstH || dstW >= srcW) return false;
+        // FS_SHARED_SCALE=0 makes every consumer read the full source again, so the two can be compared
+        static const bool disabled = []() {
+            const char* v = getenv("FS_SHARED_SCALE");
+            return v && v[0] == '0';
+        }();
+        if (disabled) return false;
+        // the constant buffer this pass fills is created with the per-target shaders
+        if (!EnsureScShader()) return false;
+        if (!ssShader) {
+            ComPtr<ID3DBlob> blob, errBlob;
+            if (FAILED(D3DCompile(kScaleSourceHLSL, strlen(kScaleSourceHLSL), "scalesource.hlsl", nullptr, nullptr, "SSMain", "cs_5_0", 0, 0, &blob, &errBlob))) return false;
+            if (FAILED(device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &ssShader))) return false;
+        }
+        if (!ssTex || ssW != dstW || ssH != dstH) {
+            ssSrv.Reset(); ssUav.Reset(); ssTex.Reset();
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = dstW; td.Height = dstH; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+            if (FAILED(device->CreateTexture2D(&td, nullptr, &ssTex))) return false;
+            if (FAILED(device->CreateUnorderedAccessView(ssTex.Get(), nullptr, &ssUav))) return false;
+            if (FAILED(device->CreateShaderResourceView(ssTex.Get(), nullptr, &ssSrv))) return false;
+            ssW = dstW; ssH = dstH;
+        }
         ComPtr<ID3D11ShaderResourceView> srv;
         D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
         sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         sv.Texture2D.MipLevels = 1;
-        if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "downscale SRV creation failed"; return false; }
-        DsParams p{ srcW, srcH, dstW, dstH, videoOn ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
-        context->UpdateSubresource(dsParamsCb.Get(), 0, nullptr, &p, 0, 0);
+        if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "scale source SRV creation failed"; return false; }
+        ScParams p{ srcW, srcH, dstW, dstH, 0, 0, 0, 0, videoOn ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
+        context->UpdateSubresource(scParamsCb.Get(), 0, nullptr, &p, 0, 0);
         ID3D11ShaderResourceView* srvs[] = { srv.Get(), VideoSrv() };
+        ID3D11UnorderedAccessView* uavs[] = { ssUav.Get() };
+        ID3D11Buffer* cbs[] = { scParamsCb.Get() };
+        context->CSSetShader(ssShader.Get(), nullptr, 0);
+        context->CSSetShaderResources(0, 2, srvs);
+        context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        context->CSSetConstantBuffers(0, 1, cbs);
+        context->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
+        ID3D11ShaderResourceView* nullSrv[] = { nullptr, nullptr };
+        ID3D11UnorderedAccessView* nullUav[] = { nullptr };
+        context->CSSetShaderResources(0, 2, nullSrv);
+        context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+        ssReady = true;
+        return true;
+    }
+
+    // GPU box-downscale `shared` (BGRA) -> dsOutStaging (small tightly-packed BGRA). Queues GPU work only;
+    // the caller's WaitGpu() covers completion, and ReadPending() maps dsOutStaging out.
+    bool DownscaleToStaging(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::string& err) {
+        if (!EnsureDsShader()) { err = "downscale shader init failed"; return false; }
+        if (!EnsureDsOutBuffer((size_t)dstW * dstH * 4)) { err = "downscale output buffer creation failed"; return false; }
+        ScaleSrc src;
+        if (!PickScaleSrc(shared, srcW, srcH, dstW, dstH, src, err)) { err = "downscale SRV creation failed"; return false; }
+        DsParams p{ src.w, src.h, dstW, dstH, (videoOn && !src.composited) ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
+        context->UpdateSubresource(dsParamsCb.Get(), 0, nullptr, &p, 0, 0);
+        ID3D11ShaderResourceView* srvs[] = { src.srv, VideoSrv() };
         ID3D11UnorderedAccessView* uavs[] = { dsOutUav.Get() };
         ID3D11Buffer* cbs[] = { dsParamsCb.Get() };
         context->CSSetShader(dsShader.Get(), nullptr, 0);
@@ -1568,6 +1711,26 @@ struct ReadbackContext {
                          : ReadbackBgra(shared.Get(), width, height, pendingBgra, err);
             pendingTotal = pendingBgra.size();
         }
+        // Every consumer smaller than the render used to box-filter the whole frame for itself. With two or
+        // more of them that is the source read two or more times over; instead it is read once into a shared
+        // scale source at the largest of their sizes and they filter from that. With fewer than two there is
+        // nothing to share, so the intermediate is not built and each pass reads the source as before.
+        ssReady = false;
+        if (ok) {
+            uint32_t shareW = 0, shareH = 0;
+            int smallConsumers = 0;
+            if (dstW > 0 && dstH > 0 && dstW < width) {
+                smallConsumers++;
+                if (dstW > shareW) { shareW = dstW; shareH = dstH; }
+            }
+            for (const auto& t : targets) {
+                if (t.w >= width) continue;
+                smallConsumers++;
+                if (t.w > shareW) { shareW = t.w; shareH = t.h; }
+            }
+            if (smallConsumers >= 2 && shareW) BuildScaleSource(shared.Get(), width, height, shareW, shareH, err);
+        }
+
         // optional GPU downscale for server/stage, queued before the single GPU wait below (small WC copy-out;
         // its D3D11 objects live on whichever device this context has — unchanged on 11On12)
         pendingScaledTotal = 0;
@@ -1581,6 +1744,8 @@ struct ReadbackContext {
             if (targetSlots.size() < targets.size()) targetSlots.resize(targets.size());
             for (size_t i = 0; i < targets.size() && ok; ++i) ok = ScaleConvertToStaging(shared.Get(), width, height, targets[i], targetSlots[i], err);
         }
+        // the intermediate belongs to the passes queued above and to nothing after them
+        ssReady = false;
         // Ensure the GPU is done reading `shared` before the caller releases it.
         if (on12Active) {
             // Harness-proven single-device sequence: submit all queued 11On12 work to the DIRECT queue, fence
