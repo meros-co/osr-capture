@@ -24,6 +24,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -524,6 +525,16 @@ id<MTLTexture> VidTexOf(const VideoTex& vt) {
     return (vt.on && vt.tex) ? vt.tex : Ctx().dummyVideo;
 }
 
+// FS_SHARED_SCALE=0 makes every consumer read the render again, as it did before the shared source, so
+// a suspected difference in the picture can be checked against the direct read on any platform.
+static bool SharedScaleDisabled() {
+    static const bool off = []() {
+        const char* v = std::getenv("FS_SHARED_SCALE");
+        return v && v[0] == '0';
+    }();
+    return off;
+}
+
 // Reused GPU output buffers, keyed the way the caller keys its N-API buffer pool (FreeShow passes the output
 // id, plus a slot suffix for pipelined captures). Avoids a per-frame MTLBuffer allocation. Guarded by g_mutex.
 struct KeyBufs {
@@ -632,7 +643,7 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
             if (t.w > shareW) { shareW = t.w; shareH = t.h; }
         }
         id<MTLTexture> shareTex = nil;
-        if (shareUsers >= 2 && shareW > 0 && shareH > 0 && ctx.psoShare) {
+        if (shareUsers >= 2 && shareW > 0 && shareH > 0 && ctx.psoShare && !SharedScaleDisabled()) {
             if (!ctx.shareTex || ctx.shareW != shareW || ctx.shareH != shareH) {
                 MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:shareW height:shareH mipmapped:NO];
                 td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;

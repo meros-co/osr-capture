@@ -288,6 +288,16 @@ void main() {
 }
 )GLSL";
 
+// FS_SHARED_SCALE=0 makes every consumer read the render again, as it did before the shared source, so
+// a suspected difference in the picture can be checked against the direct read on any platform.
+static bool SharedScaleDisabled() {
+    static const bool off = []() {
+        const char* v = std::getenv("FS_SHARED_SCALE");
+        return v && v[0] == '0';
+    }();
+    return off;
+}
+
 // The shared scale source. Consumers smaller than the render each box-filtered the whole frame for
 // themselves; this produces one composited downscale at the largest of their sizes, in the SOURCE's own
 // channel order and already un-flipped, so a pass sampling it (with uFlipY and uVideoOn off) behaves
@@ -1175,7 +1185,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
         if ((int)t.w > shareW) { shareW = (int)t.w; shareH = (int)t.h; }
     }
     bool haveShare = false;
-    if (shareUsers >= 2 && shareW > 0 && shareH > 0) {
+    if (shareUsers >= 2 && shareW > 0 && shareH > 0 && !SharedScaleDisabled()) {
         std::string serr;
         if (EnsureTarget(ks.texShare, ks.fboShare, ks.shareW, ks.shareH, shareW, shareH, serr)) {
             DrawTo(pShare_, ks.fboShare, shareW, shareH, srcTex, (int)w, (int)h);

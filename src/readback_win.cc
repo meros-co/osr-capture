@@ -586,6 +586,16 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
 }
 )HLSL";
 
+// FS_SHARED_SCALE=0 makes every consumer read the render again, as it did before the shared source, so
+// a suspected difference in the picture can be checked against the direct read on any platform.
+static bool SharedScaleDisabled() {
+    static const bool off = []() {
+        const char* v = std::getenv("FS_SHARED_SCALE");
+        return v && v[0] == '0';
+    }();
+    return off;
+}
+
 // The shared scale source. Every consumer smaller than the render used to box-filter the FULL frame for
 // itself, so N small consumers read the 4K source N times. This produces one intermediate at the largest
 // of their sizes - compositing the video layer as it goes, once - and they sample that instead. It reuses
@@ -1415,12 +1425,7 @@ struct ReadbackContext {
     // smaller consumer then samples. Returns false to mean "carry on reading the full source directly".
     bool BuildScaleSource(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::string& err) {
         if (!dstW || !dstH || dstW >= srcW) return false;
-        // FS_SHARED_SCALE=0 makes every consumer read the full source again, so the two can be compared
-        static const bool disabled = []() {
-            const char* v = getenv("FS_SHARED_SCALE");
-            return v && v[0] == '0';
-        }();
-        if (disabled) return false;
+        if (SharedScaleDisabled()) return false;
         // the constant buffer this pass fills is created with the per-target shaders
         if (!EnsureScShader()) return false;
         if (!ssShader) {
