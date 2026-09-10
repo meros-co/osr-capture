@@ -34,9 +34,20 @@ inline uint8_t chromaV(int r, int g, int b) {
 
 }  // namespace
 
+static void UyvyInto(const uint8_t* bgra, uint32_t width, uint32_t height, uint8_t* dst);
+static void UyvaInto(const uint8_t* bgra, uint32_t width, uint32_t height, uint8_t* dst);
+
 void ConvertBgraToUyvyRaw(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& out) {
-    out.resize(static_cast<size_t>(width) * 2 * height);
-    uint8_t* dst = out.data();
+    out.resize(ConvertedSize(width, height, 1));
+    UyvyInto(bgra, width, height, out.data());
+}
+
+void ConvertBgraToUyvaRaw(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& out) {
+    out.resize(ConvertedSize(width, height, 2));
+    UyvaInto(bgra, width, height, out.data());
+}
+
+static void UyvyInto(const uint8_t* bgra, uint32_t width, uint32_t height, uint8_t* dst) {
     for (uint32_t y = 0; y < height; ++y) {
         const uint8_t* s = bgra + static_cast<size_t>(y) * width * 4;
         uint8_t* d = dst + static_cast<size_t>(y) * width * 2;
@@ -53,10 +64,8 @@ void ConvertBgraToUyvyRaw(const uint8_t* bgra, uint32_t width, uint32_t height, 
     }
 }
 
-void ConvertBgraToUyvaRaw(const uint8_t* bgra, uint32_t width, uint32_t height, std::vector<uint8_t>& out) {
+static void UyvaInto(const uint8_t* bgra, uint32_t width, uint32_t height, uint8_t* dst) {
     const size_t uyvySize = static_cast<size_t>(width) * 2 * height;
-    out.resize(uyvySize + static_cast<size_t>(width) * height);
-    uint8_t* dst = out.data();
     uint8_t* alpha = dst + uyvySize;
     for (uint32_t y = 0; y < height; ++y) {
         const uint8_t* s = bgra + static_cast<size_t>(y) * width * 4;
@@ -78,85 +87,113 @@ void ConvertBgraToUyvaRaw(const uint8_t* bgra, uint32_t width, uint32_t height, 
     }
 }
 
-bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t height, int format) {
-    // format 3 = RGBA: swap the R and B channels in place (for WebRTC's ImageData, which is RGBA). Same size.
-    if (format == 3) {
-        uint8_t* p = buf.data();
-        const size_t n = static_cast<size_t>(width) * height;
-        for (size_t i = 0; i < n; ++i) std::swap(p[i * 4], p[i * 4 + 2]);
-        return true;
-    }
-    // format 4 = planar I420 (Y, then U, then V at half resolution), BT.601 limited range — the same
-    // coefficients as the GPU kernels, so a CPU-fallback frame matches a GPU one.
-    if (format == 4) {
-        const uint32_t cw = width / 2, ch = height / 2;
-        std::vector<uint8_t> out(static_cast<size_t>(width) * height + 2u * static_cast<size_t>(cw) * ch);
-        const uint8_t* src = buf.data();
-        uint8_t* yp = out.data();
-        uint8_t* up = yp + static_cast<size_t>(width) * height;
-        uint8_t* vp = up + static_cast<size_t>(cw) * ch;
-        for (uint32_t y = 0; y < height; ++y) {
-            const uint8_t* row = src + static_cast<size_t>(y) * width * 4;
-            uint8_t* yrow = yp + static_cast<size_t>(y) * width;
-            for (uint32_t x = 0; x < width; ++x) {
-                const int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
-                int luma = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                yrow[x] = static_cast<uint8_t>(luma < 16 ? 16 : (luma > 235 ? 235 : luma));
-            }
+static void I420Into(const uint8_t* src, uint32_t width, uint32_t height, uint8_t* dst) {
+    const uint32_t cw = width / 2, ch = height / 2;
+    uint8_t* yp = dst;
+    uint8_t* up = yp + static_cast<size_t>(width) * height;
+    uint8_t* vp = up + static_cast<size_t>(cw) * ch;
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* row = src + static_cast<size_t>(y) * width * 4;
+        uint8_t* yrow = yp + static_cast<size_t>(y) * width;
+        for (uint32_t x = 0; x < width; ++x) {
+            const int b = row[x * 4], g = row[x * 4 + 1], r = row[x * 4 + 2];
+            int luma = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            yrow[x] = static_cast<uint8_t>(luma < 16 ? 16 : (luma > 235 ? 235 : luma));
         }
-        for (uint32_t cy = 0; cy < ch; ++cy) {
-            for (uint32_t cx = 0; cx < cw; ++cx) {
-                int rs = 0, gs = 0, bs = 0;
-                for (uint32_t dy = 0; dy < 2; ++dy) {
-                    const uint8_t* row = src + (static_cast<size_t>(cy) * 2 + dy) * width * 4;
-                    for (uint32_t dx = 0; dx < 2; ++dx) {
-                        const uint32_t x = cx * 2 + dx;
-                        bs += row[x * 4];
-                        gs += row[x * 4 + 1];
-                        rs += row[x * 4 + 2];
-                    }
+    }
+    for (uint32_t cy = 0; cy < ch; ++cy) {
+        for (uint32_t cx = 0; cx < cw; ++cx) {
+            int rs = 0, gs = 0, bs = 0;
+            for (uint32_t dy = 0; dy < 2; ++dy) {
+                const uint8_t* row = src + (static_cast<size_t>(cy) * 2 + dy) * width * 4;
+                for (uint32_t dx = 0; dx < 2; ++dx) {
+                    const uint32_t x = cx * 2 + dx;
+                    bs += row[x * 4];
+                    gs += row[x * 4 + 1];
+                    rs += row[x * 4 + 2];
                 }
-                const int r = (rs + 2) / 4, g = (gs + 2) / 4, b = (bs + 2) / 4;
-                int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                up[static_cast<size_t>(cy) * cw + cx] = static_cast<uint8_t>(u < 16 ? 16 : (u > 240 ? 240 : u));
-                vp[static_cast<size_t>(cy) * cw + cx] = static_cast<uint8_t>(v < 16 ? 16 : (v > 240 ? 240 : v));
+            }
+            const int r = (rs + 2) / 4, g = (gs + 2) / 4, b = (bs + 2) / 4;
+            int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
+            int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+            up[static_cast<size_t>(cy) * cw + cx] = static_cast<uint8_t>(u < 16 ? 16 : (u > 240 ? 240 : u));
+            vp[static_cast<size_t>(cy) * cw + cx] = static_cast<uint8_t>(v < 16 ? 16 : (v > 240 ? 240 : v));
+        }
+    }
+}
+
+size_t ConvertedSize(uint32_t width, uint32_t height, int format) {
+    const size_t px = static_cast<size_t>(width) * height;
+    if (format == 1) return px * 2;
+    if (format == 2) return px * 3;
+    if (format == 4) return px + 2u * (static_cast<size_t>(width / 2) * (height / 2));
+    return px * 4;  // 0 = BGRA, 3 = RGBA
+}
+
+bool ConvertBgraInto(const uint8_t* src, uint32_t width, uint32_t height, int format, uint8_t* dst) {
+    // 3 = RGBA: a channel swap, so it is also the one format that may be done in place
+    if (format == 3) {
+        const size_t n = static_cast<size_t>(width) * height;
+        if (dst == src) {
+            for (size_t i = 0; i < n; ++i) std::swap(dst[i * 4], dst[i * 4 + 2]);
+        } else {
+            for (size_t i = 0; i < n; ++i) {
+                dst[i * 4] = src[i * 4 + 2];
+                dst[i * 4 + 1] = src[i * 4 + 1];
+                dst[i * 4 + 2] = src[i * 4];
+                dst[i * 4 + 3] = src[i * 4 + 3];
             }
         }
-        buf.swap(out);
         return true;
     }
-    if (format != 1 && format != 2) return false;
-    std::vector<uint8_t> converted;
-    if (format == 2) {
-        ConvertBgraToUyvaRaw(buf.data(), width, height, converted);
-    } else {
-        ConvertBgraToUyvyRaw(buf.data(), width, height, converted);
+    if (format == 1) {
+        UyvyInto(src, width, height, dst);
+        return true;
     }
-    buf.swap(converted);
+    if (format == 2) {
+        UyvaInto(src, width, height, dst);
+        return true;
+    }
+    if (format == 4) {
+        I420Into(src, width, height, dst);
+        return true;
+    }
+    return false;
+}
+
+// Vector form for the readback backends, which hold their frame in a vector. Format 3 converts in place;
+// every other format needs a differently sized destination, so it swaps in a new buffer.
+bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t height, int format) {
+    if (format == 3) return ConvertBgraInto(buf.data(), width, height, 3, buf.data());
+    if (format != 1 && format != 2 && format != 4) return false;
+    std::vector<uint8_t> out(ConvertedSize(width, height, format));
+    ConvertBgraInto(buf.data(), width, height, format, out.data());
+    buf.swap(out);
     return true;
 }
 
-Napi::Value ConvertBgraToUyvy(const Napi::CallbackInfo& info) {
+// Every export below allocates its result once and converts straight into it. Converting into a scratch
+// vector and copying that into a Buffer allocated a whole second frame and memcpy'd it, per call.
+static Napi::Value ConvertInto(const Napi::CallbackInfo& info, int format) {
     Napi::Env env = info.Env();
     Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
     uint32_t width = info[1].As<Napi::Number>().Uint32Value();
     uint32_t height = info[2].As<Napi::Number>().Uint32Value();
 
-    std::vector<uint8_t> out;
-    ConvertBgraToUyvyRaw(src.Data(), width, height, out);
-    return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::New(env, ConvertedSize(width, height, format));
+    if (!ConvertBgraInto(src.Data(), width, height, format, out.Data())) {
+        Napi::Error::New(env, "convert failed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    return out;
+}
+
+Napi::Value ConvertBgraToUyvy(const Napi::CallbackInfo& info) {
+    return ConvertInto(info, 1);
 }
 
 Napi::Value ConvertBgraToUyva(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
-    uint32_t width = info[1].As<Napi::Number>().Uint32Value();
-    uint32_t height = info[2].As<Napi::Number>().Uint32Value();
-
-    std::vector<uint8_t> out;
-    ConvertBgraToUyvaRaw(src.Data(), width, height, out);
-    return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
+    return ConvertInto(info, 2);
 }
 
 // Native box-filter downscale of tightly-packed BGRA (srcW*srcH*4) to dstW*dstH*4. Averages each destination
@@ -167,7 +204,12 @@ void DownscaleBgraRaw(const uint8_t* s, uint32_t srcW, uint32_t srcH, uint32_t d
     if (dstW < 1) dstW = 1;
     if (dstH < 1) dstH = 1;
     out.resize(static_cast<size_t>(dstW) * dstH * 4);
-    uint8_t* d = out.data();
+    DownscaleBgraInto(s, srcW, srcH, dstW, dstH, out.data());
+}
+
+void DownscaleBgraInto(const uint8_t* s, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, uint8_t* d) {
+    if (dstW < 1) dstW = 1;
+    if (dstH < 1) dstH = 1;
 
     for (uint32_t dy = 0; dy < dstH; ++dy) {
         uint32_t sy0 = static_cast<uint32_t>(static_cast<uint64_t>(dy) * srcH / dstH);
@@ -208,24 +250,16 @@ Napi::Value DownscaleBgra(const Napi::CallbackInfo& info) {
     uint32_t dstW = info[3].As<Napi::Number>().Uint32Value();
     uint32_t dstH = info[4].As<Napi::Number>().Uint32Value();
 
-    std::vector<uint8_t> out;
-    DownscaleBgraRaw(src.Data(), srcW, srcH, dstW, dstH, out);
-    return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
+    if (dstW < 1) dstW = 1;
+    if (dstH < 1) dstH = 1;
+    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::New(env, static_cast<size_t>(dstW) * dstH * 4);
+    DownscaleBgraInto(src.Data(), srcW, srcH, dstW, dstH, out.Data());
+    return out;
 }
 
 // planar I420 for the RTMP encoder, for the rare frame no GPU pass produced one for
 Napi::Value ConvertBgraToI420(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
-    uint32_t width = info[1].As<Napi::Number>().Uint32Value();
-    uint32_t height = info[2].As<Napi::Number>().Uint32Value();
-
-    std::vector<uint8_t> buf(src.Data(), src.Data() + src.ByteLength());
-    if (!ConvertBgraInPlace(buf, width, height, 4)) {
-        Napi::Error::New(env, "convertBgraToI420 failed").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-    return Napi::Buffer<uint8_t>::Copy(env, buf.data(), buf.size());
+    return ConvertInto(info, 4);
 }
 
 void RegisterConvert(Napi::Env env, Napi::Object exports) {
