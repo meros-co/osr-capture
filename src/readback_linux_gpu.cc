@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -500,19 +501,33 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         return q_.size();
     }
-    // Run `fn` on the GL thread and wait for it. Must not be called FROM the GL thread.
-    void Run(const std::function<void()>& fn) {
-        std::mutex dm;
-        std::condition_variable dcv;
-        bool done = false;
-        Post([&] {
+    // Run `fn` on the GL thread and wait for it. Must not be called FROM the GL thread. Returns false if
+    // the job did not finish in time, in which case it may still be running: the shared wait state outlives
+    // this call so a late completion has nothing of ours to touch.
+    //
+    // Every GPU wait inside a job is already bounded by kFenceTimeoutNs, and a job contains at most the
+    // draw fence and the read fence, so a job that has not returned in twice that plus one more interval
+    // for the CPU work around them is not slow - the GL thread is wedged, and waiting forever here would
+    // take every caller down with it.
+    bool Run(const std::function<void()>& fn) {
+        struct WaitState {
+            std::mutex m;
+            std::condition_variable cv;
+            bool done = false;
+        };
+        auto state = std::make_shared<WaitState>();
+        Post([state, fn] {
             fn();
-            std::lock_guard<std::mutex> lk(dm);
-            done = true;
-            dcv.notify_all();
+            std::lock_guard<std::mutex> lk(state->m);
+            state->done = true;
+            state->cv.notify_all();
         });
-        std::unique_lock<std::mutex> lk(dm);
-        dcv.wait(lk, [&] { return done; });
+        const auto limit = std::chrono::nanoseconds(kFenceTimeoutNs * 3);
+        std::unique_lock<std::mutex> lk(state->m);
+        if (state->cv.wait_for(lk, limit, [&] { return state->done; })) return true;
+        fprintf(stderr, "[osr-capture] GL thread did not finish a job within %llums; giving up on it\n",
+                (unsigned long long)(kFenceTimeoutNs * 3 / 1000000ULL));
+        return false;
     }
 
     // ---- GL-thread-only operations (call via Run/Post) ---------------------------------------------------
