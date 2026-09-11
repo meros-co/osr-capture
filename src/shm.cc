@@ -26,8 +26,8 @@ struct Mapping {
     void* ptr = nullptr;
     size_t size = 0;
     bool owner = false;
-    // copies currently reading or writing ptr, from any thread. A copy holds a reference for its whole
-    // duration, so the region cannot be released underneath it and no lock need be held while it runs.
+    // copies reading or writing ptr, from any thread; a copy holds a reference for its whole duration,
+    // so the region cannot be released underneath it and no lock is held while it runs
     std::atomic<int> inflight{0};
     std::atomic<bool> unmapRequested{false};  // shmUnmap during copies: release when the last one lands
 #if defined(_WIN32)
@@ -37,9 +37,9 @@ struct Mapping {
 #endif
 };
 
-// The mutex guards the TABLE (find/insert/erase), never a copy. Holding it across a memcpy made every
-// ring in the process wait behind whichever one was copying - at 4K that is a 33MB copy per frame per
-// output. Mappings are held by pointer so an entry keeps its address when the table rehashes.
+// The mutex guards the TABLE (find/insert/erase), never a copy: holding it across a memcpy would make
+// every ring wait behind whichever one is copying. Mappings are held by pointer so an entry keeps its
+// address when the table rehashes.
 std::unordered_map<std::string, std::unique_ptr<Mapping>> g_maps;
 std::mutex g_mapsMutex;
 
@@ -148,8 +148,7 @@ Napi::Value ShmMap(const Napi::CallbackInfo& info) {
 }
 
 // Resolves (name, offset, view) to the mapped byte range and takes a reference on the mapping, so the
-// copy that follows can run with no lock held and the region cannot be released underneath it. Throws
-// on a bad range, in which case no reference is taken.
+// copy that follows runs with no lock held. Throws on a bad range, taking no reference.
 static bool AcquireRange(const Napi::CallbackInfo& info, const char* fn, Mapping** mapping, uint8_t** base, uint8_t** js, size_t* len) {
     Napi::Env env = info.Env();
     if (info.Length() < 3 || !info[0].IsString() || !info[1].IsNumber() || !info[2].IsTypedArray()) {

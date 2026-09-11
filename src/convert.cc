@@ -17,7 +17,7 @@ namespace osrcap {
 
 namespace {
 
-// JavaScript stores a double into a byte array by clamping then truncating toward zero; this matches it
+// JavaScript stores a double into a byte array by clamping then truncating toward zero
 inline uint8_t clampd(double v) {
     if (!(v > 0.0)) return 0;
     if (v > 255.0) return 255;
@@ -179,8 +179,7 @@ bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t heig
     return true;
 }
 
-// Every export below allocates its result once and converts straight into it. Converting into a scratch
-// vector and copying that into a Buffer allocated a whole second frame and memcpy'd it, per call.
+// each export allocates its result once and converts straight into it
 static Napi::Value ConvertInto(const Napi::CallbackInfo& info, int format) {
     Napi::Env env = info.Env();
     Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
@@ -269,12 +268,9 @@ Napi::Value ConvertBgraToI420(const Napi::CallbackInfo& info) {
     return ConvertInto(info, 4);
 }
 
-// previewFrame(src, xres, yres, format, maxWidth) -> { data, width, height }
-//
-// The small RGBA copy the app window draws of an incoming NDI/OMT/Blackmagic stream. This ran as a
-// per-pixel JavaScript loop with floating-point YUV maths in the receive process, once per frame per
-// source. Point-sampled, not filtered, and BT.709 above SD heights - the same result the JS loop gave,
-// which is what makes it a drop-in replacement. format: 0 = bgra, 1 = uyvy, 3 = rgba.
+// previewFrame(src, xres, yres, format, maxWidth) -> { data, width, height }: the small RGBA copy the
+// app window draws of an incoming stream. Point-sampled, BT.709 above SD heights, byte-for-byte what
+// previewStreamFrameJs produces. format: 0 = bgra, 1 = uyvy, 3 = rgba.
 Napi::Value PreviewFrame(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() < 5 || !info[0].IsBuffer()) {
@@ -311,8 +307,8 @@ Napi::Value PreviewFrame(const Napi::CallbackInfo& info) {
     uint8_t* dst = out.Data();
 
     if (format == 1) {
-        // BT.709 above SD heights, matching what the capture libraries auto-detect. Kept in double so the
-        // result is byte-for-byte what the JavaScript loop this replaces produced.
+        // BT.709 above SD heights, matching what the capture libraries auto-detect. Double, so the result
+        // matches the JavaScript reference exactly.
         const bool bt709 = yres >= 720;
         const double kr = bt709 ? 1.5748 : 1.402;
         const double kb = bt709 ? 1.8556 : 1.772;

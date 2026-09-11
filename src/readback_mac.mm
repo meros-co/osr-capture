@@ -200,11 +200,9 @@ inline float4 boxAvg(texture2d<float, access::read> src, texture2d<float, access
     return overVideo(acc / float(cnt), vid, p.vid, dx, dy, p.dstW, p.dstH);
 }
 
-// The shared scale source. Consumers smaller than the render each box-filter the whole frame for
-// themselves, so two or more of them read the render two or more times over. This produces one composited
-// downscale at the largest of their sizes, in the render's own channel order, and they box-filter from that
-// instead. Its output is what src would have given them, so the passes below are unchanged apart from
-// which texture they read and having the layer already composited in.
+// The shared scale source: one composited downscale at the largest size any consumer smaller than the
+// render wants, in the render's own channel order. Its output is what src would have given them, so the
+// passes below differ only in which texture they read and in the layer already being composited.
 kernel void shareScale(texture2d<float, access::read> src [[texture(0)]],
                        texture2d<float, access::read> vid [[texture(1)]],
                        texture2d<float, access::write> out [[texture(2)]],
@@ -525,8 +523,7 @@ id<MTLTexture> VidTexOf(const VideoTex& vt) {
     return (vt.on && vt.tex) ? vt.tex : Ctx().dummyVideo;
 }
 
-// FS_SHARED_SCALE=0 makes every consumer read the render again, as it did before the shared source, so
-// a suspected difference in the picture can be checked against the direct read on any platform.
+// FS_SHARED_SCALE=0 makes every consumer read the render directly, to compare against the shared source
 static bool SharedScaleDisabled() {
     static const bool off = []() {
         const char* v = std::getenv("FS_SHARED_SCALE");
@@ -627,10 +624,8 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
             [blit endEncoding];
         }
 
-        // Read the render once for every consumer smaller than it. Packed UYVA and I420 targets keep
-        // reading it directly - their plane packing is tied to the source layout - so the shared source
-        // only exists when two consumers that can use it are present, and when it does not, every pass
-        // below reads `tex` exactly as before.
+        // Read the render once for the consumers smaller than it. Packed UYVA and I420 targets read it
+        // directly - their plane packing is tied to its layout - so only the others count towards the two.
         uint32_t shareW = 0, shareH = 0;
         int shareUsers = 0;
         if (scaledBuf && dstW > 0 && dstH > 0 && dstW < width) {
@@ -665,7 +660,7 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
                 shareTex = ctx.shareTex;
             }
         }
-        // a pass reading the shared source must not composite the layer a second time
+        // the shared source is already composited
         const VidParams vidOff{0, 0, 0, 0};
 
         if (scaledBuf && dstW > 0 && dstH > 0) {

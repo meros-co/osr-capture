@@ -32,9 +32,7 @@ inline size_t TargetBytes(const TargetSpec& t) {
 // Whether this platform's GPU backend produces TargetSpec outputs (Windows D3D11 today).
 bool TargetsSupported();
 
-// How many readbacks this backend can have in flight at once. The pipeline depth JavaScript derives from
-// measurement is bounded by this, so it has to come FROM the backend rather than being restated there:
-// the two drifting apart means either wasted capacity or a stall against a limit nobody can see.
+// How many readbacks this backend can have in flight at once; bounds the depth the caller derives.
 size_t MaxConcurrentReadbacks();
 
 // A video frame composited UNDER the captured page in the same pass, so live input never has to travel

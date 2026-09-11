@@ -288,8 +288,7 @@ void main() {
 }
 )GLSL";
 
-// FS_SHARED_SCALE=0 makes every consumer read the render again, as it did before the shared source, so
-// a suspected difference in the picture can be checked against the direct read on any platform.
+// FS_SHARED_SCALE=0 makes every consumer read the render directly, to compare against the shared source
 static bool SharedScaleDisabled() {
     static const bool off = []() {
         const char* v = std::getenv("FS_SHARED_SCALE");
@@ -298,10 +297,9 @@ static bool SharedScaleDisabled() {
     return off;
 }
 
-// The shared scale source. Consumers smaller than the render each box-filtered the whole frame for
-// themselves; this produces one composited downscale at the largest of their sizes, in the SOURCE's own
-// channel order and already un-flipped, so a pass sampling it (with uFlipY and uVideoOn off) behaves
-// exactly as if it were sampling the render.
+// The shared scale source: one composited downscale for consumers smaller than the render to sample. In
+// the SOURCE's channel order and already un-flipped, so a pass reading it (uFlipY and uVideoOn off)
+// behaves as if it were reading the render.
 const char* kFragShare = R"GLSL(
 void main() {
     ivec2 d = ivec2(gl_FragCoord.xy);
@@ -525,14 +523,9 @@ public:
         std::lock_guard<std::mutex> lk(m_);
         return q_.size();
     }
-    // Run `fn` on the GL thread and wait for it. Must not be called FROM the GL thread. Returns false if
-    // the job did not finish in time, in which case it may still be running: the shared wait state outlives
-    // this call so a late completion has nothing of ours to touch.
-    //
-    // Every GPU wait inside a job is already bounded by kFenceTimeoutNs, and a job contains at most the
-    // draw fence and the read fence, so a job that has not returned in twice that plus one more interval
-    // for the CPU work around them is not slow - the GL thread is wedged, and waiting forever here would
-    // take every caller down with it.
+    // Run `fn` on the GL thread and wait for it. Must not be called FROM the GL thread. False = it did not
+    // finish in time and may still be running, so the wait state is shared and outlives this call. The
+    // bound is kFenceTimeoutNs times the fences a job can hold, past which the thread is wedged, not slow.
     bool Run(const std::function<void()>& fn) {
         struct WaitState {
             std::mutex m;
@@ -1168,11 +1161,9 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     }
 
     // ---- draws (the only stage that READS the dmabuf) ----------------------------------------------------
-    // Consumers smaller than the render each box-filter the whole frame, so two or more of them read the
-    // source two or more times over. Read it once into a shared scale source at the largest of their sizes
-    // and let them filter from that. Packed UYVA and I420 targets keep reading the source directly - their
-    // plane packing is tied to the source layout - so the share only exists when two plain or UYVY
-    // consumers can use it, and when it does not exist nothing below changes.
+    // With two or more consumers smaller than the render, read it once into a shared scale source at the
+    // largest of their sizes. Packed UYVA and I420 targets read the source directly - their plane packing
+    // is tied to its layout - so only plain and UYVY consumers count towards the two.
     int shareW = 0, shareH = 0, shareUsers = 0;
     auto canShare = [](int fmt) { return fmt == 0 || fmt == 1 || fmt == 3; };
     if (wantScaled && (int)dstW < (int)w) {

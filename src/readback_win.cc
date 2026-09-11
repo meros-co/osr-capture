@@ -546,9 +546,8 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
     if (px >= gDstW || y >= gDstH) return;
     float4 c0 = overVideo(boxAvg(px, y), px, y, gDstW, gDstH);
     float4 c1 = (px + 1 < gDstW) ? overVideo(boxAvg(px + 1, y), px + 1, y, gDstW, gDstH) : c0;
-    // 0 = BGRA and 3 = RGBA are the same four bytes per pixel in a different order. Anything that is not
-    // one of them is a packed format, handled below - a format with no branch here must never fall into
-    // that, or it is written at half the stride and read back as two rows side by side.
+    // 0 = BGRA and 3 = RGBA are the same four bytes in a different order; everything else is packed and
+    // handled below, so a format with no branch here would be written at half the stride.
     if (gFormat == 0 || gFormat == 3) {
         uint b0 = (uint)toByte(gFormat == 0 ? c0.b : c0.r);
         uint r0 = (uint)toByte(gFormat == 0 ? c0.r : c0.b);
@@ -586,8 +585,7 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
 }
 )HLSL";
 
-// FS_SHARED_SCALE=0 makes every consumer read the render again, as it did before the shared source, so
-// a suspected difference in the picture can be checked against the direct read on any platform.
+// FS_SHARED_SCALE=0 makes every consumer read the render directly, to compare against the shared source
 static bool SharedScaleDisabled() {
     static const bool off = []() {
         const char* v = std::getenv("FS_SHARED_SCALE");
@@ -596,11 +594,9 @@ static bool SharedScaleDisabled() {
     return off;
 }
 
-// The shared scale source. Every consumer smaller than the render used to box-filter the FULL frame for
-// itself, so N small consumers read the 4K source N times. This produces one intermediate at the largest
-// of their sizes - compositing the video layer as it goes, once - and they sample that instead. It reuses
-// the same box filter and the same compositing as the per-target shader, so a target fed from here is the
-// same image it would have produced itself, filtered in two steps rather than one.
+// The shared scale source: one intermediate at the largest size any consumer smaller than the render
+// wants, so they sample it instead of each box-filtering the full frame. Same box filter and compositing
+// as the per-target shader, so a target fed from here is filtered in two steps rather than one.
 const char* kScaleSourceHLSL = R"HLSL(
 Texture2D<float4> gSrc : register(t0);
 RWTexture2D<float4> gOut : register(u0);
@@ -1392,9 +1388,8 @@ struct ReadbackContext {
         return true;
     }
 
-    // The texture a downscaling pass should read: this frame's shared scale source when it exists and is
-    // still at least as large as what is being produced, else the render itself. The scale source already
-    // has the video layer composited into it, so a pass reading it must not composite again.
+    // The texture a downscaling pass reads: this frame's shared scale source when it is at least as large
+    // as what is being produced, else the render. The scale source is already composited.
     struct ScaleSrc {
         ComPtr<ID3D11ShaderResourceView> own;
         ID3D11ShaderResourceView* srv = nullptr;
@@ -1421,8 +1416,7 @@ struct ReadbackContext {
         return true;
     }
 
-    // Build the shared scale source for this frame: one composited box-downscale of `shared` that every
-    // smaller consumer then samples. Returns false to mean "carry on reading the full source directly".
+    // One composited box-downscale of `shared` for smaller consumers to sample; false = read it directly.
     bool BuildScaleSource(ID3D11Texture2D* shared, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::string& err) {
         if (!dstW || !dstH || dstW >= srcW) return false;
         if (SharedScaleDisabled()) return false;
@@ -1723,10 +1717,8 @@ struct ReadbackContext {
                          : ReadbackBgra(shared.Get(), width, height, pendingBgra, err);
             pendingTotal = pendingBgra.size();
         }
-        // Every consumer smaller than the render used to box-filter the whole frame for itself. With two or
-        // more of them that is the source read two or more times over; instead it is read once into a shared
-        // scale source at the largest of their sizes and they filter from that. With fewer than two there is
-        // nothing to share, so the intermediate is not built and each pass reads the source as before.
+        // With two or more consumers smaller than the render, read it once into a shared scale source at
+        // the largest of their sizes and let them filter from that; with fewer there is nothing to share.
         ssReady = false;
         if (ok) {
             uint32_t shareW = 0, shareH = 0;
@@ -1756,7 +1748,7 @@ struct ReadbackContext {
             if (targetSlots.size() < targets.size()) targetSlots.resize(targets.size());
             for (size_t i = 0; i < targets.size() && ok; ++i) ok = ScaleConvertToStaging(shared.Get(), width, height, targets[i], targetSlots[i], err);
         }
-        // the intermediate belongs to the passes queued above and to nothing after them
+        // the intermediate belongs to the passes queued above
         ssReady = false;
         // Ensure the GPU is done reading `shared` before the caller releases it.
         if (on12Active) {

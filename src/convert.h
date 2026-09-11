@@ -11,7 +11,7 @@
 namespace osrcap {
 
 // Bytes a converted frame occupies, so a caller can size a destination before converting.
-// format: 0/3 = BGRA/RGBA (w*h*4), 1 = UYVY (w*2*h), 2 = UYVA (w*3*h), 4 = I420 (w*h + 2*(w/2)*(h/2)).
+// 0/3 = BGRA/RGBA (w*h*4), 1 = UYVY (w*2*h), 2 = UYVA (w*3*h), 4 = I420 (w*h + 2*(w/2)*(h/2)).
 size_t ConvertedSize(uint32_t width, uint32_t height, int format);
 
 // Convert straight into caller memory. `dst` must hold ConvertedSize(width, height, format) bytes and
