@@ -640,7 +640,9 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
         id<MTLTexture> shareTex = nil;
         if (shareUsers >= 2 && shareW > 0 && shareH > 0 && ctx.psoShare && !SharedScaleDisabled()) {
             if (!ctx.shareTex || ctx.shareW != shareW || ctx.shareH != shareH) {
-                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:shareW height:shareH mipmapped:NO];
+                // RGBA8Unorm, not BGRA8Unorm: Metal applies the BGRA swizzle when a texture is READ but not
+                // when one is written, so a BGRA share texture comes back with red and blue exchanged.
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:shareW height:shareH mipmapped:NO];
                 td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
                 td.storageMode = MTLStorageModePrivate;
                 ctx.shareTex = [ctx.device newTextureWithDescriptor:td];
