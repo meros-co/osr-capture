@@ -38,15 +38,23 @@ size_t MaxConcurrentReadbacks();
 // A video frame composited UNDER the captured page in the same pass, so live input never has to travel
 // through the browser's GPU thread to reach the output. `data` is the caller's buffer, read during the
 // consume call only. format: 0 = BGRA, 1 = UYVY, 3 = RGBA. An empty layer (w == 0) composites nothing.
+// Instead of `data` the frame can be a shared GPU texture (`handle`, same encoding as a capture source):
+// one decode of a video shown on several outputs, never read back to the CPU. It is fitted to the page
+// on the GPU: fit 0 = stretch, 1 = contain (the rest filled with fillR/G/B), 2 = cover (cropped).
 struct VideoLayer {
     const uint8_t* data = nullptr;
     size_t bytes = 0;
     uint32_t w = 0;
     uint32_t h = 0;
     int format = 0;
+    uintptr_t handle = 0;
+    int fit = 0;
+    uint8_t fillR = 0, fillG = 0, fillB = 0;
 };
-// Whether this platform's GPU backend composites a VideoLayer (Windows D3D11 today).
+// Whether this platform's GPU backend composites a VideoLayer.
 bool VideoLayerSupported();
+// Whether a VideoLayer can be a shared GPU texture (`handle`) on this platform (Windows D3D11 today).
+bool MediaLayerSupported();
 
 // format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (colour + alpha), 3 = RGBA (swizzle). All three
 // platforms convert on the GPU — Windows HLSL compute, macOS Metal compute, Linux GLES3 shader — and each

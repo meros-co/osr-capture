@@ -253,6 +253,7 @@ bool TargetsSupported() { return true; }
 // The GLES convert/scale shaders composite the layer under the page (GPU path only — see the video
 // overload of ReadbackConsume); macOS still draws the frame in the page.
 bool VideoLayerSupported() { return true; }
+bool MediaLayerSupported() { return false; }
 // one GL thread, FIFO, each key holding its own textures and PBO: no context pool to run out of
 size_t MaxConcurrentReadbacks() { return 64; }
 }  // namespace osrcap

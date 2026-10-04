@@ -473,6 +473,20 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
             video.w = v.Get("width").As<Napi::Number>().Uint32Value();
             video.h = v.Get("height").As<Napi::Number>().Uint32Value();
             video.format = v.Has("format") ? v.Get("format").As<Napi::Number>().Int32Value() : 0;
+        } else if (v.Get("handle").IsBuffer()) {
+            Napi::Buffer<uint8_t> hb = v.Get("handle").As<Napi::Buffer<uint8_t>>();
+            if (hb.Length() >= sizeof(uintptr_t)) std::memcpy(&video.handle, hb.Data(), sizeof(uintptr_t));
+            video.w = v.Get("width").As<Napi::Number>().Uint32Value();
+            video.h = v.Get("height").As<Napi::Number>().Uint32Value();
+            video.fit = v.Has("fit") ? v.Get("fit").As<Napi::Number>().Int32Value() : 0;
+            if (v.Get("fill").IsArray()) {
+                Napi::Array f = v.Get("fill").As<Napi::Array>();
+                if (f.Length() >= 3) {
+                    video.fillR = (uint8_t)f.Get((uint32_t)0).As<Napi::Number>().Uint32Value();
+                    video.fillG = (uint8_t)f.Get((uint32_t)1).As<Napi::Number>().Uint32Value();
+                    video.fillB = (uint8_t)f.Get((uint32_t)2).As<Napi::Number>().Uint32Value();
+                }
+            }
         }
     }
 #if defined(_WIN32) || defined(__APPLE__)
@@ -628,6 +642,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("targetsSupported", Napi::Boolean::New(env, osrcap::TargetsSupported()));
     exports.Set("maxConcurrentReadbacks", Napi::Number::New(env, static_cast<double>(osrcap::MaxConcurrentReadbacks())));
     exports.Set("videoLayerSupported", Napi::Boolean::New(env, osrcap::VideoLayerSupported()));
+    exports.Set("mediaLayerSupported", Napi::Boolean::New(env, osrcap::MediaLayerSupported()));
 #endif
 #if defined(_WIN32)
     exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));

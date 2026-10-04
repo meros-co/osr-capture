@@ -998,6 +998,7 @@ bool TargetsSupported() { return true; }
 size_t MaxConcurrentReadbacks() { return 64; }
 // The video layer is composited in the Metal convert pass (see overVideo in kMetalSource).
 bool VideoLayerSupported() { return true; }
+bool MediaLayerSupported() { return false; }
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
     return ConsumeImpl(handle, width, height, format, key, dstW, dstH, targets, video, err);
 }

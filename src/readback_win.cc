@@ -862,6 +862,17 @@ struct ReadbackContext {
     ComPtr<ID3D11ShaderResourceView> videoSrv;
     ComPtr<ID3D11Texture2D> dummyTex;
     ComPtr<ID3D11ShaderResourceView> dummySrv;
+
+    // shared-texture video source: the media window's frames opened on this device (Electron cycles a few
+    // textures, so they are cached by handle), copied into a texture shaped to the page
+    std::map<uintptr_t, ComPtr<ID3D11Texture2D>> mediaOpened;
+    ID3D11Device* mediaDevice = nullptr;
+    ComPtr<ID3D11Texture2D> fitTex;
+    ComPtr<ID3D11ShaderResourceView> fitSrv;
+    uint32_t fitW = 0, fitH = 0;
+    DXGI_FORMAT fitFormat = DXGI_FORMAT_UNKNOWN;
+    uint32_t fitFill = 0xffffffff;
+    bool mediaOn = false;
     uint32_t videoTexW = 0;
     uint32_t videoTexH = 0;
     uint32_t videoW = 0;
@@ -1303,8 +1314,10 @@ struct ReadbackContext {
     // Upload one video frame into this context's own texture, on the CALLING thread and this device — so
     // live input reaches the output without passing through the browser's GPU thread. UYVY is stored as a
     // half-width RGBA texture and decoded in the shader.
-    bool SetVideoLayer(const osrcap::VideoLayer& video, std::string& err) {
+    bool SetVideoLayer(const osrcap::VideoLayer& video, uint32_t pageW, uint32_t pageH, std::string& err) {
         videoOn = false;
+        mediaOn = false;
+        if (video.handle) return SetVideoLayerShared(video, pageW, pageH, err);
         if (!video.w || !video.h || !video.data) return true;
         const uint32_t texels = video.format == 1 ? video.w / 2 : video.w;  // UYVY packs two pixels per texel
         const uint32_t rowBytes = texels * 4;
@@ -1338,8 +1351,109 @@ struct ReadbackContext {
         return true;
     }
 
+    // The frame is copied out under the texture's keyed mutex, so Electron can reuse it as soon as this
+    // call returns, and every output reading the same frame gets its own copy at its own aspect.
+    bool SetVideoLayerShared(const osrcap::VideoLayer& video, uint32_t pageW, uint32_t pageH, std::string& err) {
+        if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
+        if (mediaDevice != device.Get()) {
+            mediaOpened.clear();
+            fitSrv.Reset();
+            fitTex.Reset();
+            fitW = fitH = 0;
+            mediaDevice = device.Get();
+        }
+        ComPtr<ID3D11Texture2D> src;
+        auto it = mediaOpened.find(video.handle);
+        if (it != mediaOpened.end()) {
+            src = it->second;
+        } else {
+            if (!OpenSharedTex(video.handle, src, err)) return false;
+            if (mediaDevice != device.Get()) return SetVideoLayerShared(video, pageW, pageH, err);  // the chain was reset
+            if (mediaOpened.size() >= 8) mediaOpened.clear();
+            mediaOpened[video.handle] = src;
+        }
+
+        D3D11_TEXTURE2D_DESC sd;
+        src->GetDesc(&sd);
+        int fmt;
+        if (sd.Format == DXGI_FORMAT_B8G8R8A8_UNORM) fmt = 0;
+        else if (sd.Format == DXGI_FORMAT_R8G8B8A8_UNORM) fmt = 3;
+        else { err = "media texture format unsupported"; return false; }
+
+        // the part of the frame that is shown, and where it lands in the fitted texture
+        const uint32_t vw = sd.Width, vh = sd.Height;
+        uint32_t sx = 0, sy = 0, sw = vw, sh = vh, tw = vw, th = vh, dx = 0, dy = 0;
+        const double pageAspect = pageH ? (double)pageW / pageH : (double)vw / vh;
+        const double videoAspect = (double)vw / vh;
+        if (video.fit == 2 && videoAspect != pageAspect) {
+            if (videoAspect > pageAspect) {
+                sw = std::max<uint32_t>(1, (uint32_t)(vh * pageAspect + 0.5));
+                sx = (vw - sw) / 2;
+            } else {
+                sh = std::max<uint32_t>(1, (uint32_t)(vw / pageAspect + 0.5));
+                sy = (vh - sh) / 2;
+            }
+            tw = sw;
+            th = sh;
+        } else if (video.fit == 1 && videoAspect != pageAspect) {
+            if (videoAspect > pageAspect) {
+                th = std::max<uint32_t>(vh, (uint32_t)(vw / pageAspect + 0.5));
+                dy = (th - vh) / 2;
+            } else {
+                tw = std::max<uint32_t>(vw, (uint32_t)(vh * pageAspect + 0.5));
+                dx = (tw - vw) / 2;
+            }
+        }
+
+        const bool resized = !fitTex || fitW != tw || fitH != th || fitFormat != sd.Format;
+        if (resized) {
+            fitSrv.Reset();
+            fitTex.Reset();
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = tw;
+            td.Height = th;
+            td.MipLevels = 1;
+            td.ArraySize = 1;
+            td.Format = sd.Format;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(device->CreateTexture2D(&td, nullptr, &fitTex))) { err = "media fit texture creation failed"; return false; }
+            if (FAILED(device->CreateShaderResourceView(fitTex.Get(), nullptr, &fitSrv))) { err = "media fit SRV creation failed"; return false; }
+            fitW = tw;
+            fitH = th;
+            fitFormat = sd.Format;
+            fitFill = 0xffffffff;
+        }
+        // the letterbox only changes with the size or the colour, so it is drawn then and not per frame
+        const uint32_t fill = ((uint32_t)video.fillR << 16) | ((uint32_t)video.fillG << 8) | video.fillB;
+        if ((tw != sw || th != sh) && fitFill != fill) {
+            std::vector<uint32_t> px((size_t)tw * th);
+            const uint32_t texel = fmt == 3 ? (0xff000000u | ((uint32_t)video.fillB << 16) | ((uint32_t)video.fillG << 8) | video.fillR)
+                                             : (0xff000000u | ((uint32_t)video.fillR << 16) | ((uint32_t)video.fillG << 8) | video.fillB);
+            std::fill(px.begin(), px.end(), texel);
+            context->UpdateSubresource(fitTex.Get(), 0, nullptr, px.data(), tw * 4, 0);
+            fitFill = fill;
+        }
+
+        ComPtr<IDXGIKeyedMutex> keyedMutex;
+        const bool haveKeyedMutex = SUCCEEDED(src.As(&keyedMutex)) && keyedMutex;
+        if (haveKeyedMutex && keyedMutex->AcquireSync(0, 1000) != S_OK) { err = "media keyed mutex AcquireSync failed/timed out"; return false; }
+        D3D11_BOX box = { sx, sy, 0, sx + sw, sy + sh, 1 };
+        context->CopySubresourceRegion(fitTex.Get(), 0, dx, dy, 0, src.Get(), 0, &box);
+        if (haveKeyedMutex) keyedMutex->ReleaseSync(0);
+
+        mediaOn = true;
+        videoOn = true;
+        videoW = tw;
+        videoH = th;
+        videoFormat = fmt;
+        return true;
+    }
+
     // the video SRV to bind at t1 (a 1x1 dummy when there is no layer, so the slot is always valid)
     ID3D11ShaderResourceView* VideoSrv() {
+        if (videoOn && mediaOn && fitSrv) return fitSrv.Get();
         if (videoOn && videoSrv) return videoSrv.Get();
         if (!dummySrv) {
             D3D11_TEXTURE2D_DESC td = {};
@@ -1565,7 +1679,7 @@ struct ReadbackContext {
 
         SwParams p{ width, height, keepBgra ? 1u : 0u, 0u, videoOn ? 1u : 0u, videoW, videoH, (uint32_t)videoFormat };
         context->UpdateSubresource(swizzleParamsCb.Get(), 0, nullptr, &p, 0, 0);
-        ID3D11ShaderResourceView* srvs[] = { srv.Get(), videoOn ? videoSrv.Get() : dummySrv.Get() };
+        ID3D11ShaderResourceView* srvs[] = { srv.Get(), VideoSrv() };
         ID3D11UnorderedAccessView* uavs[] = { outUav.Get() };
         ID3D11Buffer* cbs[] = { swizzleParamsCb.Get() };
         context->CSSetShader(swizzleShader.Get(), nullptr, 0);
@@ -1684,7 +1798,7 @@ struct ReadbackContext {
         // the convert is time Electron's frame pool is waiting on us, and a 4K upload in there costs
         // paints. EnsureDevice is what OpenSharedTex would call anyway.
         if (video.w && !EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
-        if (!SetVideoLayer(video, err)) return false;
+        if (!SetVideoLayer(video, width, height, err)) return false;
         ComPtr<ID3D11Texture2D> shared;
         if (!OpenSharedTex(handle, shared, err)) return false;
 
@@ -1901,6 +2015,7 @@ bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int form
 }
 
 bool VideoLayerSupported() { return true; }
+bool MediaLayerSupported() { return true; }
 
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
     ReadbackContext* ctx = AcquireContext();
