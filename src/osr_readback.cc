@@ -230,10 +230,10 @@ public:
     void Execute() override {
         std::string err;
 #if defined(_WIN32) || defined(__APPLE__)
-        bool ok = video_.w ? osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
+        bool ok = (video_.w || video_.mediaCount) ? osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
                            : osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #elif defined(__linux__)
-        bool ok = video_.w ? osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
+        bool ok = (video_.w || video_.mediaCount) ? osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, video_, err)
                            : osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, targets_, err);
 #endif
         if (!ok) SetError(err.empty() ? "consume failed" : err);
@@ -473,12 +473,20 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
             video.w = v.Get("width").As<Napi::Number>().Uint32Value();
             video.h = v.Get("height").As<Napi::Number>().Uint32Value();
             video.format = v.Has("format") ? v.Get("format").As<Napi::Number>().Int32Value() : 0;
-        } else if (v.Get("handle").IsBuffer()) {
-            Napi::Buffer<uint8_t> hb = v.Get("handle").As<Napi::Buffer<uint8_t>>();
-            if (hb.Length() >= sizeof(uintptr_t)) std::memcpy(&video.handle, hb.Data(), sizeof(uintptr_t));
-            video.w = v.Get("width").As<Napi::Number>().Uint32Value();
-            video.h = v.Get("height").As<Napi::Number>().Uint32Value();
-            video.fit = v.Has("fit") ? v.Get("fit").As<Napi::Number>().Int32Value() : 0;
+        } else if (v.Get("media").IsArray()) {
+            // { media: [{ handle, fit, alpha }], fill: [r, g, b] }
+            Napi::Array layers = v.Get("media").As<Napi::Array>();
+            for (uint32_t i = 0; i < layers.Length() && video.mediaCount < 2; i++) {
+                if (!layers.Get(i).IsObject()) continue;
+                Napi::Object l = layers.Get(i).As<Napi::Object>();
+                if (!l.Get("handle").IsBuffer()) continue;
+                Napi::Buffer<uint8_t> hb = l.Get("handle").As<Napi::Buffer<uint8_t>>();
+                if (hb.Length() < sizeof(uintptr_t)) continue;
+                osrcap::MediaLayer& m = video.media[video.mediaCount++];
+                std::memcpy(&m.handle, hb.Data(), sizeof(uintptr_t));
+                m.fit = l.Get("fit").IsNumber() ? l.Get("fit").As<Napi::Number>().Int32Value() : 0;
+                m.alpha = l.Get("alpha").IsNumber() ? (float)l.Get("alpha").As<Napi::Number>().DoubleValue() : 1.0f;
+            }
             if (v.Get("fill").IsArray()) {
                 Napi::Array f = v.Get("fill").As<Napi::Array>();
                 if (f.Length() >= 3) {

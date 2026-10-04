@@ -38,17 +38,23 @@ size_t MaxConcurrentReadbacks();
 // A video frame composited UNDER the captured page in the same pass, so live input never has to travel
 // through the browser's GPU thread to reach the output. `data` is the caller's buffer, read during the
 // consume call only. format: 0 = BGRA, 1 = UYVY, 3 = RGBA. An empty layer (w == 0) composites nothing.
-// Instead of `data` the frame can be a shared GPU texture (`handle`, same encoding as a capture source):
-// one decode of a video shown on several outputs, never read back to the CPU. It is fitted to the page
-// on the GPU: fit 0 = stretch, 1 = contain (the rest filled with fillR/G/B), 2 = cover (cropped).
+// Instead of `data` the layer can be built from shared GPU textures (`media`, same handle encoding as a
+// capture source): one decode of a video shown on several outputs, never read back to the CPU. Up to two
+// are drawn bottom to top over the fill colour - two while one background fades into another - each
+// fitted to the page (fit 0 = stretch, 1 = contain, 2 = cover) at its own opacity.
+struct MediaLayer {
+    uintptr_t handle = 0;
+    int fit = 0;
+    float alpha = 1.0f;
+};
 struct VideoLayer {
     const uint8_t* data = nullptr;
     size_t bytes = 0;
     uint32_t w = 0;
     uint32_t h = 0;
     int format = 0;
-    uintptr_t handle = 0;
-    int fit = 0;
+    MediaLayer media[2];
+    int mediaCount = 0;
     uint8_t fillR = 0, fillG = 0, fillB = 0;
 };
 // Whether this platform's GPU backend composites a VideoLayer.
