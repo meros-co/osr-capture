@@ -34,8 +34,19 @@
 #include <vector>
 
 namespace {
-// Copy FROM GPU-mapped memory with MOVNTDQA streaming loads. `src` must be 16-byte aligned.
+// Copy FROM GPU-mapped memory with MOVNTDQA streaming loads. A mapped texture's
+// base is aligned, but its row pitch need not preserve that alignment for every row.
 inline void StreamCopyFromWC(void* dst, const void* src, size_t bytes) {
+    if (bytes == 0) return;
+    const size_t misalignment = reinterpret_cast<uintptr_t>(src) & 15u;
+    if (misalignment != 0) {
+        const size_t prefix = std::min(bytes, size_t(16) - misalignment);
+        std::memcpy(dst, src, prefix);
+        dst = static_cast<char*>(dst) + prefix;
+        src = static_cast<const char*>(src) + prefix;
+        bytes -= prefix;
+        if (bytes == 0) return;
+    }
     auto* s = static_cast<const __m128i*>(src);
     auto* d = static_cast<__m128i*>(dst);
     size_t blocks = bytes / 16;
@@ -1698,7 +1709,7 @@ struct ReadbackContext {
         const size_t rowBytes = (size_t)width * 4;
         out.resize(rowBytes * height);
         const uint8_t* src = (const uint8_t*)map.pData;
-        // stream-copy each row: map.pData / RowPitch are 16-byte aligned (WC memory) -> use MOVNTDQA
+        // Stream-copy each row, handling row pitches that do not preserve 16-byte alignment.
         for (UINT y = 0; y < height; ++y) StreamCopyFromWC(out.data() + (size_t)y * rowBytes, src + (size_t)y * map.RowPitch, rowBytes);
         context->Unmap(staging.Get(), 0);
         return true;
