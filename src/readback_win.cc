@@ -935,6 +935,11 @@ struct ReadbackContext {
     };
     std::vector<OpenedTex> opened;
     uint64_t openSeq = 0;
+    // How far apart reuses of one texture are (in lookups): the pool's cycle as this context sees it. The
+    // cache keeps that many textures plus one, least recently used out first, so cyclic reuse always hits
+    // while a churning pool (textures replaced rather than reused) cannot grow it. Learned per window of
+    // lookups as long as the cache itself, so it follows the pool when it grows or shrinks.
+    uint64_t reuseSpan = 0, windowSpan = 0, windowLeft = 0;
     void ForgetOpened() {
         for (auto& e : opened) if (e.dup) CloseHandle(e.dup);
         opened.clear();
@@ -1136,9 +1141,16 @@ struct ReadbackContext {
         const HANDLE h = reinterpret_cast<HANDLE>(handle);
         const auto compare = CompareHandles();
         const uint64_t now = ++openSeq;
+        if (windowLeft == 0) {
+            reuseSpan = windowSpan;
+            windowSpan = 0;
+            windowLeft = opened.size() + 1;
+        }
+        windowLeft--;
         if (compare) {
             for (auto& e : opened) {
                 if (!compare(e.dup, h)) continue;
+                windowSpan = std::max<uint64_t>(windowSpan, now - e.lastUse);
                 e.lastUse = now;
                 shared = e.tex;
                 if (entry) *entry = &e;
@@ -1149,10 +1161,20 @@ struct ReadbackContext {
         HANDLE dup = nullptr;
         if (compare && DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
             // a texture the pool stopped cycling through is let go: kept, the duplicate would hold it alive
-            const uint64_t horizon = now > 2 * (opened.size() + 1) ? now - 2 * (opened.size() + 1) : 0;
-            for (auto it = opened.begin(); it != opened.end();) {
-                if (it->lastUse < horizon) { CloseHandle(it->dup); it = opened.erase(it); }
-                else ++it;
+            if (reuseSpan) {
+                // least recently used out first, down to the learned span (see reuseSpan)
+                while (!opened.empty() && opened.size() >= reuseSpan + 1) {
+                    auto lru = std::min_element(opened.begin(), opened.end(), [](const OpenedTex& a, const OpenedTex& b) { return a.lastUse < b.lastUse; });
+                    CloseHandle(lru->dup);
+                    opened.erase(lru);
+                }
+            } else {
+                // no reuse seen yet: drop what has gone unused for two cache-lengths of lookups
+                const uint64_t horizon = now > 2 * (opened.size() + 1) ? now - 2 * (opened.size() + 1) : 0;
+                for (auto it = opened.begin(); it != opened.end();) {
+                    if (it->lastUse < horizon) { CloseHandle(it->dup); it = opened.erase(it); }
+                    else ++it;
+                }
             }
             OpenedTex e;
             e.dup = dup;
