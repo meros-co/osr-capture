@@ -869,6 +869,17 @@ struct SwParams {
     uint32_t videoFormat;
 };
 
+// CompareObjectHandles (Windows 10 1607+): whether two handles name the same kernel object. Looked up at run
+// time so an older system simply opens every texture, as before.
+using CompareObjectHandlesFn = BOOL(WINAPI*)(HANDLE, HANDLE);
+CompareObjectHandlesFn CompareHandles() {
+    static const CompareObjectHandlesFn fn = [] {
+        HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+        return kb ? reinterpret_cast<CompareObjectHandlesFn>(GetProcAddress(kb, "CompareObjectHandles")) : nullptr;
+    }();
+    return fn;
+}
+
 struct ReadbackContext {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11Device1> device1;
@@ -912,9 +923,23 @@ struct ReadbackContext {
     ComPtr<ID3D11Texture2D> dummyTex;
     ComPtr<ID3D11ShaderResourceView> dummySrv;
 
-    // shared-texture video source: the media window's frames opened on this device (Electron cycles a few
-    // textures, so they are cached by handle), copied into a texture shaped to the page
-    std::map<uintptr_t, ComPtr<ID3D11ShaderResourceView>> mediaOpened;
+    // Shared textures arrive with a fresh handle every frame, but Chromium cycles a small pool of textures
+    // behind them, and opening one costs milliseconds. Each texture opened is kept with a duplicate of its
+    // handle, and a later handle reuses it only when the kernel confirms both name the same texture: the
+    // value alone proves nothing, since Electron closes each handle and the value is handed out again.
+    struct OpenedTex {
+        HANDLE dup = nullptr;
+        ComPtr<ID3D11Texture2D> tex;
+        ComPtr<ID3D11ShaderResourceView> srv;  // made on first use as a media layer
+        uint64_t lastUse = 0;
+    };
+    std::vector<OpenedTex> opened;
+    uint64_t openSeq = 0;
+    void ForgetOpened() {
+        for (auto& e : opened) if (e.dup) CloseHandle(e.dup);
+        opened.clear();
+    }
+    // shared-texture video source: the media window's frames, opened on this device through the cache above
     ID3D11Device* mediaDevice = nullptr;
     ComPtr<ID3D11Texture2D> fitTex;
     ComPtr<ID3D11ShaderResourceView> fitSrv;
@@ -977,6 +1002,7 @@ struct ReadbackContext {
     bool deviceLost = false;      // fence watchdog fired / device removed -> rebuild the chain on next use
 
     ~ReadbackContext() {
+        ForgetOpened();
         if (rbPtr && rbBuf) rbBuf->Unmap(0, nullptr);
         if (d12Event) CloseHandle(d12Event);
     }
@@ -984,6 +1010,7 @@ struct ReadbackContext {
     // Full device-chain reset (both backends): every device-derived object dies with the device. Used when a
     // backend init fails partway (fall back clean) and when the fence watchdog marks the device lost.
     void ResetDeviceChain() {
+        ForgetOpened();  // textures opened on the old device
         shader.Reset();
         paramsCb.Reset();
         swizzleShader.Reset();
@@ -1102,7 +1129,42 @@ struct ReadbackContext {
     // incompatible with this driver's shared-handle path (structural, not a retry count), disable it
     // process-wide, rebuild this context classic, and retry the open once. Once a context HAS opened
     // successfully, later failures are treated as transient (resize churn, dead handle) exactly as today.
-    bool OpenSharedTex(uintptr_t handle, ComPtr<ID3D11Texture2D>& shared, std::string& err) {
+    // the cached open (see `opened`); `entry` is the cache slot, or null when the texture could not be cached
+    bool OpenSharedTex(uintptr_t handle, ComPtr<ID3D11Texture2D>& shared, std::string& err, OpenedTex** entry = nullptr) {
+        if (entry) *entry = nullptr;
+        if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
+        const HANDLE h = reinterpret_cast<HANDLE>(handle);
+        const auto compare = CompareHandles();
+        const uint64_t now = ++openSeq;
+        if (compare) {
+            for (auto& e : opened) {
+                if (!compare(e.dup, h)) continue;
+                e.lastUse = now;
+                shared = e.tex;
+                if (entry) *entry = &e;
+                return true;
+            }
+        }
+        if (!OpenSharedTexUncached(handle, shared, err)) return false;
+        HANDLE dup = nullptr;
+        if (compare && DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            // a texture the pool stopped cycling through is let go: kept, the duplicate would hold it alive
+            const uint64_t horizon = now > 2 * (opened.size() + 1) ? now - 2 * (opened.size() + 1) : 0;
+            for (auto it = opened.begin(); it != opened.end();) {
+                if (it->lastUse < horizon) { CloseHandle(it->dup); it = opened.erase(it); }
+                else ++it;
+            }
+            OpenedTex e;
+            e.dup = dup;
+            e.tex = shared;
+            e.lastUse = now;
+            opened.push_back(e);
+            if (entry) *entry = &opened.back();
+        }
+        return true;
+    }
+
+    bool OpenSharedTexUncached(uintptr_t handle, ComPtr<ID3D11Texture2D>& shared, std::string& err) {
         if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
         HRESULT hr = device1->OpenSharedResource1(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
         if (FAILED(hr)) hr = device->OpenSharedResource(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
@@ -1441,20 +1503,17 @@ struct ReadbackContext {
 
     // a media frame opened on this device; Electron cycles a few textures, so they are cached by handle
     bool OpenMedia(uintptr_t handle, ComPtr<ID3D11ShaderResourceView>& srv, ComPtr<ID3D11Texture2D>& tex, std::string& err) {
-        auto it = mediaOpened.find(handle);
-        if (it != mediaOpened.end()) {
-            srv = it->second;
-            ComPtr<ID3D11Resource> res;
-            srv->GetResource(&res);
-            return SUCCEEDED(res.As(&tex));
+        OpenedTex* entry = nullptr;
+        if (!OpenSharedTex(handle, tex, err, &entry)) return false;
+        if (entry && entry->srv) {
+            srv = entry->srv;
+            return true;
         }
-        if (!OpenSharedTex(handle, tex, err)) return false;
         D3D11_TEXTURE2D_DESC d;
         tex->GetDesc(&d);
         if (d.Format != DXGI_FORMAT_B8G8R8A8_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM) { err = "media texture format unsupported"; return false; }
         if (FAILED(device->CreateShaderResourceView(tex.Get(), nullptr, &srv))) { err = "media SRV creation failed"; return false; }
-        if (mediaOpened.size() >= 8) mediaOpened.clear();
-        mediaOpened[handle] = srv;
+        if (entry) entry->srv = srv;
         return true;
     }
 
@@ -1464,7 +1523,6 @@ struct ReadbackContext {
         if (!pageW || !pageH) return true;
         if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
         if (mediaDevice != device.Get()) {
-            mediaOpened.clear();
             fitSrv.Reset();
             fitUav.Reset();
             fitTex.Reset();
