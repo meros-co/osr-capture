@@ -40,7 +40,7 @@ size_t MaxConcurrentReadbacks();
 // consume call only. format: 0 = BGRA, 1 = UYVY, 3 = RGBA. An empty layer (w == 0) composites nothing.
 // Instead of `data` the layer can be built from shared GPU textures (`media`, same handle encoding as a
 // capture source): one decode of a video shown on several outputs, never read back to the CPU. Up to two
-// are drawn bottom to top over the fill colour - two while one background fades into another - each
+// are drawn bottom to top over the fill color - two while one background fades into another - each
 // fitted to the page (fit 0 = stretch, 1 = contain, 2 = cover) at its own opacity.
 struct MediaLayer {
     uintptr_t handle = 0;
@@ -62,7 +62,7 @@ bool VideoLayerSupported();
 // Whether a VideoLayer can be a shared GPU texture (`handle`) on this platform (Windows D3D11 today).
 bool MediaLayerSupported();
 
-// format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (colour + alpha), 3 = RGBA (swizzle). All three
+// format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (color + alpha), 3 = RGBA (swizzle). All three
 // platforms convert on the GPU — Windows HLSL compute, macOS Metal compute, Linux GLES3 shader — and each
 // falls back to the CPU converter only when its GPU path is unavailable for the device or the frame.
 #if defined(_WIN32) || defined(__APPLE__)

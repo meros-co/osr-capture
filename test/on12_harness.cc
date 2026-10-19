@@ -1246,7 +1246,7 @@ int main(int argc, char** argv) {
 
     // Sub-step B: readback_win.cc's live EnsureDevice now prefers the 11On12 backend itself (§5 ladder). By
     // default pin the live path to the classic backend so the "d3d11" arm stays the WC-staging BASELINE for
-    // the A/B (same binary diagnostic selector FreeShow honours). With --live=on12 the pin is skipped and the
+    // the A/B (same binary diagnostic selector FreeShow honors). With --live=on12 the pin is skipped and the
     // "d3d11"-labelled arm becomes the live LADDER path — run `--variant=d3d11 --live=on12` to soak-validate
     // the folded-in 11On12 consume (the [READBACK] backend= stderr line says which engaged). The injected
     // on12 arm never goes through EnsureDevice and is unaffected either way.

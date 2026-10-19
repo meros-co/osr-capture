@@ -2,7 +2,7 @@
 // with a compute shader, and read the result back to a CPU buffer.
 //
 // format: 0 = BGRA (raw copy), 1 = UYVY (opaque, width*2*height), 2 = UYVA (UYVY plane + width*height alpha).
-// For UYVY/UYVA the conversion runs on the GPU (no CPU colour-conversion traffic) and the smaller converted
+// For UYVY/UYVA the conversion runs on the GPU (no CPU color-conversion traffic) and the smaller converted
 // buffer is what gets read back. Each pool entry owns an independent device/context so outputs run in
 // parallel; the immediate context is only ever used by one readback at a time.
 #include "osr_readback.h"
@@ -76,7 +76,7 @@ inline void StreamCopyFromWC(void* dst, const void* src, size_t bytes) {
 // equal sample counts from `active_n` and `active_n ± 1` in interleaved sub-blocks (so load drift cancels)
 // and moves `active_n` by the SIGN of the median difference — no percent thresholds, no tuned margins; the
 // only hysteresis is integer replication on the climb (see Decide). The duty cycle IS the steady state (the
-// pool re-probes both neighbours forever, tracking knee movement with GPU load/thermals); "settled" means the
+// pool re-probes both neighbors forever, tracking knee movement with GPU load/thermals); "settled" means the
 // BASE stops drifting — a ±1 dither during probe windows is by construction, not oscillation. Workers run at
 // THREAD_PRIORITY_BELOW_NORMAL [STRUCTURAL — an OS mechanism, not a value]: WC copies are memory-stall-bound
 // so idle-core cost is ~nil, and under contention the OS scheduler (itself a measuring, adapting system)
@@ -245,7 +245,7 @@ private:
         probeSamples_.clear();
         onProbeArm_ = false;
         blockFill_ = 0;
-        // Duty cycle: alternate the probe direction so BOTH neighbours are re-tested forever (knee tracking).
+        // Duty cycle: alternate the probe direction so BOTH neighbors are re-tested forever (knee tracking).
         // At the structural bounds only the valid direction is probed.
         probeDir_ = -probeDir_;
         if (probeDir_ > 0 && newBase >= parked_) probeDir_ = -1;
@@ -583,7 +583,7 @@ void SCMain(uint3 tid : SV_DispatchThreadID) {
     if (gFormat == 2) {
         // alpha plane, one byte per pixel; this thread owns bytes px and px+1 -> write as a 16-bit store
         // via a 32-bit read-modify-write is not available on raw buffers, so the pair is packed per 4 pixels
-        // by the thread whose px % 4 == 0 using its neighbour pair's alpha.
+        // by the thread whose px % 4 == 0 using its neighbor pair's alpha.
         if ((px & 3) == 0) {
             // composited like c0/c1: a pixel the video shows through has alpha 1, and taking the page's
             // alpha for only half of each group of four left the plane inconsistent across the row
@@ -773,7 +773,7 @@ struct ScParams {
 // BGRA -> RGBA channel swap on the GPU (for WebRTC's ImageData, which is RGBA). Same size as the source, so the
 // only cost over a plain BGRA readback is the swizzle, which the GPU does for free while the readback runs.
 // Media layers (another window's shared texture: one decode shown on several outputs) composed at the
-// page's size: each sampled into its fit rectangle and drawn over the fill colour at its opacity.
+// page's size: each sampled into its fit rectangle and drawn over the fill color at its opacity.
 const char* kMediaComposeHLSL = R"HLSL(
 cbuffer P : register(b0) {
     uint gOutW; uint gOutH; uint gCount; uint gPad;

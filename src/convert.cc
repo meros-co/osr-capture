@@ -1,4 +1,4 @@
-// Native BGRA -> UYVY / UYVA colour conversion (BT.601 full range, integer/fixed-point).
+// Native BGRA -> UYVY / UYVA color conversion (BT.601 full range, integer/fixed-point).
 //
 // NDI's wire format is UYVY (4:2:2). Handing the SDK BGRA makes it do this conversion internally, which is
 // pathologically slow at 4K. Doing it here in native code is an order of magnitude faster than a JS loop, so

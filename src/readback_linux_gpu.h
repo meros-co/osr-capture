@@ -19,7 +19,7 @@ namespace linuxgpu {
 
 // Start the GL thread and create the headless EGL/GLES3 context (once). Returns true when the GPU path
 // is usable (display + context + EGL_EXT_image_dma_buf_import + GL_OES_EGL_image + shaders all OK).
-// Honours FS_LINUX_READBACK=cpu (forces false). Logs the chosen backend to stderr, once.
+// Honors FS_LINUX_READBACK=cpu (forces false). Logs the chosen backend to stderr, once.
 bool Init();
 
 // Init() succeeded (regardless of later runtime demotion) — i.e. Finish/ReleaseKey may still find state.

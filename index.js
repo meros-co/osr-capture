@@ -1,7 +1,7 @@
 // osr-capture: read back an Electron OSR shared GPU texture to a CPU buffer off the main thread.
 // See index.d.ts for the full typed API. Summary:
 //   readback(source, width, height, format = 0, poolKey?) => Promise<Buffer>
-//     format 0 = BGRA (tightly-packed), 1 = UYVY (opaque), 2 = UYVA (colour + full-res alpha), 3 = RGBA.
+//     format 0 = BGRA (tightly-packed), 1 = UYVY (opaque), 2 = UYVA (color + full-res alpha), 3 = RGBA.
 //     All platforms convert on the GPU: Windows a D3D11 compute shader, macOS a Metal compute kernel on the
 //     IOSurface wrapped zero-copy as an MTLTexture, Linux EGL/GLES3 when that path initialized (see
 //     LINUX_GPU_READBACK.md). Each falls back to the CPU converter only when its GPU path is unavailable.

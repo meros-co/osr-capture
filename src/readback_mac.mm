@@ -177,7 +177,7 @@ kernel void swizzleRgba(texture2d<float, access::read> src [[texture(0)]],
 // ---------------------------------------------------------------------------------------------------------
 // Per-consumer targets: one downscale-and-convert pass per (size, format) a consumer actually wants, ported
 // 1:1 from the Windows kScaleConvertHLSL / kScaleI420HLSL so all three backends emit the same bytes. Without
-// these every target was derived on a CPU thread (box downscale + colour convert per consumer per frame),
+// these every target was derived on a CPU thread (box downscale + color convert per consumer per frame),
 // which also forced the main readback to stay uncompressed BGRA.
 struct ScParams { uint srcW; uint srcH; uint dstW; uint dstH; uint format; uint uyvySize; VidParams vid; };
 
@@ -937,7 +937,7 @@ void ReadbackReleaseKey(const std::string& key) {
 // ---------------------------------------------------------------------------------------------------------
 // Single-dispatch readback: the whole convert + wait + copy-out in one async op, firing `onGpuDone` the
 // instant the GPU is finished with the shared texture (before the copy-out) so the caller's early-release
-// behaviour matches the two-phase path without a second N-API hop.
+// behavior matches the two-phase path without a second N-API hop.
 bool ReadbackOnce(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH,
                   uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
                   const std::function<void()>& onGpuDone, std::string& err) {

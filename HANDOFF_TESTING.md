@@ -19,7 +19,7 @@ API: `readback(source, width, height, format = 0) => Promise<Buffer>`. `source` 
 (`w*2*h` UYVY + `w*h` alpha). Also exported: synchronous CPU fallbacks `convertBgraToUyvy(buf, w, h)` and
 `convertBgraToUyva(buf, w, h)`.
 
-### Colour-convert (the `format` arg) — cross-platform status
+### Color-convert (the `format` arg) — cross-platform status
 
 NDI/SDI want UYVY, not BGRA; handing their SDKs BGRA makes them convert internally (very slow at 4K). So the
 addon can emit UYVY/UYVA directly:
@@ -39,7 +39,7 @@ addon can emit UYVY/UYVA directly:
 
 **Validate the format arg too:** run the probe once per format (0/1/2) and confirm the returned buffer length
 is `w*4*h` / `w*2*h` / `w*3*h` respectively, and (for 1/2) that a UYVY→RGB view of the buffer still shows the
-test card in the right colours (a 601/709 mismatch would show as slightly off saturation, not garbage).
+test card in the right colors (a 601/709 mismatch would show as slightly off saturation, not garbage).
 
 ## Per-platform handle format (authoritative, from Electron `shell/browser/osr/osr_paint_event.h`)
 
@@ -94,8 +94,8 @@ test card in the right colours (a 601/709 mismatch would show as slightly off sa
 
 - Terminal logs `[probe] readback N/s WxH ...` continuously with **no** `readback error:` lines.
 - `<tmpdir>/osr-test.png` (path is printed) shows the **animated test card** — a moving rounded square that
-  cycles colours plus the text "osr-capture test", on a dark background. Correct = recognizable and the
-  right colours. Wrong = black, garbage/noise, sheared/striped, or red/blue swapped.
+  cycles colors plus the text "osr-capture test", on a dark background. Correct = recognizable and the
+  right colors. Wrong = black, garbage/noise, sheared/striped, or red/blue swapped.
 - Note the readback rate and, if you can, try a larger window (edit `width/height` in `test/probe.js`).
 
 Report: platform + OS version + GPU, Electron version + arch, the first `[probe] textureInfo …` log lines,
@@ -110,7 +110,7 @@ the readback rate, whether the PNG is correct (attach it), and any error text.
   `IOSurface*`. Check the probe's `sharedTextureHandle isBuffer/len/type` log; if it isn't an 8-byte
   Buffer, adjust extraction in `src/osr_readback.cc`. The pointer is only valid in-process, which is fine
   here (the addon runs in the same process).
-- Colours swapped (red↔blue) → the surface is RGBA, not BGRA; check `info.pixelFormat`. If it's `rgba`,
+- Colors swapped (red↔blue) → the surface is RGBA, not BGRA; check `info.pixelFormat`. If it's `rgba`,
   either swizzle in `readback_mac.mm` or have the caller use `nativeImage.createFromBuffer`/adjust.
 - Apple Silicon: make sure you built with `--arch=arm64` and ran an arm64 Electron.
 

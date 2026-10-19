@@ -40,7 +40,7 @@ struct BufferPool {
 // worker thread. A single process-global map was (a) a data race — both threads insert/erase concurrently —
 // and (b) worse, the worker's releasePool() could destroy Napi::References that were CREATED on the main env
 // (main-path readback uses a bare `id` key; the worker uses `id#slot`), and destroying a reference on a
-// different env than created it is undefined behaviour. Per-env instance data gives each thread its own pools,
+// different env than created it is undefined behavior. Per-env instance data gives each thread its own pools,
 // finalized on that env's own teardown (on the right thread), so references are only ever created and
 // destroyed on their owning env, with no shared mutable state to race on.
 struct AddonData {

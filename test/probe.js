@@ -30,7 +30,7 @@ app.whenReady().then(() => {
     })
     win.webContents.setFrameRate(30)
 
-    // moving, multi-colour content so paints keep firing and correctness is obvious in the PNG
+    // moving, multi-color content so paints keep firing and correctness is obvious in the PNG
     const html = `<body style="margin:0;background:#101010;overflow:hidden">
       <div id="b" style="position:absolute;top:120px;width:220px;height:220px;border-radius:20px"></div>
       <div style="position:absolute;left:20px;top:20px;color:#fff;font:48px sans-serif">osr-capture test</div>

@@ -1,4 +1,4 @@
-// Native BGRA -> UYVY / UYVA colour conversion (BT.601 full range, integer/fixed-point).
+// Native BGRA -> UYVY / UYVA color conversion (BT.601 full range, integer/fixed-point).
 // Shared by the N-API exports (convert.cc) and the per-platform readback backends so that macOS and
 // Linux — which currently read the shared texture back as BGRA on the CPU — can still hand callers the
 // reduced NDI/SDI wire format (UYVY/UYVA) instead of BGRA, skipping the sender SDK's slow internal
