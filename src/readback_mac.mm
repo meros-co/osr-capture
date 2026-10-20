@@ -306,6 +306,30 @@ kernel void scaleI420(texture2d<float, access::read> src [[texture(0)]],
         dst[(ySize + cw * ch + cOff) >> 2] = vw;
     }
 }
+
+// Media layers: up to two shared frames (IOSurfaces of the hidden media windows) drawn over the fill into
+// a page-sized texture, which the passes above then read as the video layer. Ported from the Windows
+// kMediaComposeHLSL. dst: rect in page pixels; src: rect in source pixels; size: source w, h, opacity.
+struct McParams { uint outW; uint outH; uint count; uint pad; float4 fill; float4 dst0; float4 src0; float4 size0; float4 dst1; float4 src1; float4 size1; };
+inline float3 mcOver(float3 c, texture2d<float, access::sample> t, float2 p, float4 dst, float4 src, float4 size) {
+    constexpr sampler lin(coord::normalized, filter::linear, address::clamp_to_edge);
+    float2 f = (p - dst.xy) / dst.zw;
+    if (f.x < 0.0f || f.y < 0.0f || f.x >= 1.0f || f.y >= 1.0f) return c;
+    float2 uv = (src.xy + f * src.zw) / size.xy;
+    return mix(c, t.sample(lin, uv, level(0.0f)).rgb, size.z);
+}
+kernel void mediaCompose(texture2d<float, access::sample> l0 [[texture(0)]],
+                         texture2d<float, access::sample> l1 [[texture(1)]],
+                         texture2d<float, access::write> out [[texture(2)]],
+                         constant McParams& p [[buffer(0)]],
+                         uint2 tid [[thread_position_in_grid]]) {
+    if (tid.x >= p.outW || tid.y >= p.outH) return;
+    float2 pt = float2(tid) + 0.5f;
+    float3 c = p.fill.rgb;
+    if (p.count > 0) c = mcOver(c, l0, pt, p.dst0, p.src0, p.size0);
+    if (p.count > 1) c = mcOver(c, l1, pt, p.dst1, p.src1, p.size1);
+    out.write(float4(c, 1.0f), tid);
+}
 )MSL";
 
 // Mirrors of the MSL structs above; the trailing VidParams must stay last in both.
@@ -334,6 +358,12 @@ struct SwParams {
     uint32_t height;
     VidParams vid;
 };
+struct McParams {
+    uint32_t outW, outH, count, pad;
+    float fill[4];
+    float dst0[4], src0[4], size0[4];
+    float dst1[4], src1[4], size1[4];
+};
 struct ScParams {
     uint32_t srcW;
     uint32_t srcH;
@@ -357,6 +387,7 @@ struct MetalCtx {
     id<MTLComputePipelineState> psoScaleConvert = nil;
     id<MTLComputePipelineState> psoScaleI420 = nil;
     id<MTLComputePipelineState> psoShare = nil;
+    id<MTLComputePipelineState> psoMedia = nil;  // nil: no media layers here, the pages keep their video
     // the shared scale source, reallocated only when the size it needs changes
     id<MTLTexture> shareTex = nil;
     uint32_t shareW = 0, shareH = 0;
@@ -405,6 +436,7 @@ MetalCtx& Ctx() {
             ctx.psoScaleConvert = pso("scaleConvert");
             ctx.psoShare = pso("shareScale");
             ctx.psoScaleI420 = pso("scaleI420");
+            ctx.psoMedia = pso("mediaCompose");
             // An IOSurface-backed texture must use Shared storage on unified-memory (Apple Silicon) devices
             // and Managed on discrete/Intel ones. The same rule applies to the CPU-written video layer.
             ctx.ioSurfaceStorage = ctx.device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
@@ -551,6 +583,9 @@ struct KeyBufs {
     std::vector<size_t> targetSizes;
     std::vector<std::vector<uint8_t>> cpuTargets;
     VideoTex vtex;  // this output's video layer texture, reused across frames
+    // this output's composed media layers, at its page size (RGBA8Unorm, for the reason given at shareTex)
+    id<MTLTexture> mediaTex = nil;
+    uint32_t mediaW = 0, mediaH = 0;
 };
 
 std::mutex g_mutex;
@@ -565,12 +600,23 @@ id<MTLBuffer> EnsureBuffer(id<MTLBuffer> existing, size_t& existingSize, size_t 
     return [Ctx().device newBufferWithLength:needed options:MTLResourceStorageModeShared];
 }
 
+// The media layers of one frame: composed into `out` (the page's size) first in the same command buffer,
+// which the convert passes then read as the video layer.
+struct MediaPass {
+    IOSurfaceRef surface[2] = {nullptr, nullptr};
+    uint32_t surfW[2] = {0, 0}, surfH[2] = {0, 0};
+    int count = 0;
+    McParams params = {};
+    id<MTLTexture> out = nil;
+};
+
 // Run the GPU convert (+ optional downscale) for one frame and BLOCK until the GPU has finished reading the
 // IOSurface. On return the caller may release the Electron shared texture; the results live in the returned
 // MTLBuffers. This is the whole "consume" phase — see the two-phase contract in osr_readback.h.
 bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH,
             id<MTLBuffer> mainBuf, id<MTLBuffer> scaledBuf, const std::vector<TargetSpec>& targets,
-            const std::vector<id<MTLBuffer>>& targetBufs, const VideoTex& vtex, std::string& err) {
+            const std::vector<id<MTLBuffer>>& targetBufs, const VideoTex& vtex, std::string& err,
+            const MediaPass* media = nullptr) {
     MetalCtx& ctx = Ctx();
     const VidParams vid = VidOf(vtex);
     id<MTLTexture> vidTex = VidTexOf(vtex);
@@ -585,6 +631,26 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
         if (!cb) {
             err = "failed to create Metal command buffer";
             return false;
+        }
+
+        // the media layers first; Metal orders the passes below after this write to the layer texture
+        if (media && media->count) {
+            id<MTLTexture> layers[2] = {nil, nil};
+            for (int i = 0; i < media->count; ++i) {
+                layers[i] = WrapSurface(media->surface[i], media->surfW[i], media->surfH[i]);
+                if (!layers[i]) {
+                    err = "failed to wrap a media IOSurface as MTLTexture";
+                    return false;
+                }
+            }
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:ctx.psoMedia];
+            [enc setTexture:layers[0] atIndex:0];
+            [enc setTexture:(media->count > 1 ? layers[1] : layers[0]) atIndex:1];
+            [enc setTexture:media->out atIndex:2];
+            [enc setBytes:&media->params length:sizeof(McParams) atIndex:0];
+            [enc dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            [enc endEncoding];
         }
 
         if (format == 1 || format == 2) {
@@ -773,7 +839,9 @@ bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, 
         return false;
     }
     const bool wantScaled = dstW > 0 && dstH > 0;
-    const bool haveVideo = video.w && video.h && video.data;
+    const bool haveData = video.w && video.h && video.data;
+    const bool haveMedia = video.mediaCount > 0;
+    const bool haveVideo = haveData || haveMedia;
 
     // Frame the GPU path can't take (non-BGRA surface, width not a multiple of 4): convert on the CPU now and
     // stash the bytes for Finish. Rare-to-never in practice, but it keeps the contract total.
@@ -814,12 +882,78 @@ bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, 
     // paints. It is also done outside g_mutex — the local copy holds the texture alive (ARC) — so it never
     // serializes another output's consume behind it.
     VideoTex vtex;
-    if (haveVideo) {
+    if (haveData) {
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             vtex = g_keys[key].vtex;
         }
         if (!UploadVideoLayer(video, vtex, err)) return false;
+    }
+
+    // Media layers: each a shared frame of a hidden media window, drawn over the fill into this output's
+    // own page-sized texture in the same command buffer (see MediaPass), which then is the video layer.
+    MediaPass media;
+    if (haveMedia) {
+        if (!Ctx().psoMedia) {
+            err = "media layers need the Metal compose kernel";
+            return false;
+        }
+        McParams& p = media.params;
+        p.outW = width;
+        p.outH = height;
+        p.fill[0] = video.fillR / 255.0f;
+        p.fill[1] = video.fillG / 255.0f;
+        p.fill[2] = video.fillB / 255.0f;
+        p.fill[3] = 1.0f;
+        for (int i = 0; i < video.mediaCount && i < 2; ++i) {
+            const MediaLayer& m = video.media[i];
+            IOSurfaceRef s = reinterpret_cast<IOSurfaceRef>(m.handle);
+            if (!s || IOSurfaceGetPixelFormat(s) != 'BGRA') {
+                err = "media IOSurface missing or not BGRA";
+                return false;
+            }
+            const uint32_t vw = static_cast<uint32_t>(IOSurfaceGetWidth(s)), vh = static_cast<uint32_t>(IOSurfaceGetHeight(s));
+            if (!vw || !vh) {
+                err = "media IOSurface is empty";
+                return false;
+            }
+            float dst[4], src[4];
+            FitMediaLayer(static_cast<float>(vw), static_cast<float>(vh), static_cast<float>(width), static_cast<float>(height), m.fit, dst, src);
+            const float size[4] = {static_cast<float>(vw), static_cast<float>(vh), MediaLayerAlpha(m.alpha), 0.0f};
+            std::memcpy(media.count == 0 ? p.dst0 : p.dst1, dst, sizeof(dst));
+            std::memcpy(media.count == 0 ? p.src0 : p.src1, src, sizeof(src));
+            std::memcpy(media.count == 0 ? p.size0 : p.size1, size, sizeof(size));
+            media.surface[media.count] = s;
+            media.surfW[media.count] = vw;
+            media.surfH[media.count] = vh;
+            media.count++;
+        }
+        p.count = static_cast<uint32_t>(media.count);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            KeyBufs& k = g_keys[key];
+            if (!k.mediaTex || k.mediaW != width || k.mediaH != height) {
+                MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                td.storageMode = MTLStorageModePrivate;
+                k.mediaTex = [Ctx().device newTextureWithDescriptor:td];
+                k.mediaW = k.mediaTex ? width : 0;
+                k.mediaH = k.mediaTex ? height : 0;
+            }
+            media.out = k.mediaTex;
+        }
+        if (!media.out) {
+            err = "media layer texture creation failed";
+            return false;
+        }
+        // read as format 0, whose .rgb is right for an RGBA8Unorm texture (it is for a BGRA8Unorm one too)
+        vtex.tex = media.out;
+        vtex.texW = width;
+        vtex.texH = height;
+        vtex.on = true;
+        vtex.w = width;
+        vtex.h = height;
+        vtex.format = 0;
     }
 
     id<MTLBuffer> mainBuf = nil;
@@ -850,10 +984,10 @@ bool ConsumeImpl(uintptr_t handle, uint32_t width, uint32_t height, int format, 
             }
         }
         targetBufs = k.targets;
-        if (haveVideo) k.vtex = vtex;  // keep the (possibly newly created) texture for the next frame
+        if (haveData) k.vtex = vtex;  // keep the (possibly newly created) texture for the next frame
     }
 
-    if (!RunGpu(surface, width, height, format, dstW, dstH, mainBuf, scaledBuf, targets, targetBufs, vtex, err)) return false;
+    if (!RunGpu(surface, width, height, format, dstW, dstH, mainBuf, scaledBuf, targets, targetBufs, vtex, err, haveMedia ? &media : nullptr)) return false;
 
     std::lock_guard<std::mutex> lock(g_mutex);
     KeyBufs& k = g_keys[key];
@@ -998,7 +1132,8 @@ bool TargetsSupported() { return true; }
 size_t MaxConcurrentReadbacks() { return 64; }
 // The video layer is composited in the Metal convert pass (see overVideo in kMetalSource).
 bool VideoLayerSupported() { return true; }
-bool MediaLayerSupported() { return false; }
+// Media layers are composed by the mediaCompose kernel, in the same command buffer as the convert.
+bool MediaLayerSupported() { return Ctx().ok && Ctx().psoMedia != nil; }
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
     return ConsumeImpl(handle, width, height, format, key, dstW, dstH, targets, video, err);
 }

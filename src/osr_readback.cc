@@ -8,6 +8,7 @@
 
 #include <napi.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -73,6 +74,9 @@ void ParseLinuxSource(Napi::Value src, std::vector<osrcap::DmabufPlane>& planes,
         modifier = mod.As<Napi::BigInt>().Uint64Value(&lossless);
     } else if (mod.IsNumber()) {
         modifier = static_cast<uint64_t>(mod.As<Napi::Number>().Int64Value());
+    } else if (mod.IsString()) {
+        // Electron hands the modifier over as a decimal string: a 64-bit value does not fit a number
+        modifier = std::strtoull(mod.As<Napi::String>().Utf8Value().c_str(), nullptr, 0);
     }
 }
 #endif
@@ -474,16 +478,26 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
             video.h = v.Get("height").As<Napi::Number>().Uint32Value();
             video.format = v.Has("format") ? v.Get("format").As<Napi::Number>().Int32Value() : 0;
         } else if (v.Get("media").IsArray()) {
-            // { media: [{ handle, fit, alpha }], fill: [r, g, b] }
+            // { media: [{ handle, width, height, fit, alpha }], fill: [r, g, b] }; handle as for a capture source
             Napi::Array layers = v.Get("media").As<Napi::Array>();
             for (uint32_t i = 0; i < layers.Length() && video.mediaCount < 2; i++) {
                 if (!layers.Get(i).IsObject()) continue;
                 Napi::Object l = layers.Get(i).As<Napi::Object>();
+                osrcap::MediaLayer layer;
+#if defined(__linux__)
+                if (!l.Get("handle").IsObject() || !l.Get("width").IsNumber() || !l.Get("height").IsNumber()) continue;
+                ParseLinuxSource(l.Get("handle"), layer.planes, layer.modifier);
+                layer.w = l.Get("width").As<Napi::Number>().Uint32Value();
+                layer.h = l.Get("height").As<Napi::Number>().Uint32Value();
+                if (layer.planes.empty() || !layer.w || !layer.h) continue;
+#else
                 if (!l.Get("handle").IsBuffer()) continue;
                 Napi::Buffer<uint8_t> hb = l.Get("handle").As<Napi::Buffer<uint8_t>>();
                 if (hb.Length() < sizeof(uintptr_t)) continue;
+                std::memcpy(&layer.handle, hb.Data(), sizeof(uintptr_t));
+#endif
                 osrcap::MediaLayer& m = video.media[video.mediaCount++];
-                std::memcpy(&m.handle, hb.Data(), sizeof(uintptr_t));
+                m = std::move(layer);
                 m.fit = l.Get("fit").IsNumber() ? l.Get("fit").As<Napi::Number>().Int32Value() : 0;
                 m.alpha = l.Get("alpha").IsNumber() ? (float)l.Get("alpha").As<Napi::Number>().DoubleValue() : 1.0f;
             }

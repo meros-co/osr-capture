@@ -33,6 +33,8 @@ bool Consume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t
              const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err, bool& importFailed);
 bool Finish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
             const std::vector<TargetDst>& targetDsts, std::string& err);
+// The GPU path is up and its media layer shader compiled.
+bool MediaSupported();
 }  // namespace linuxgpu
 
 namespace {
@@ -170,7 +172,7 @@ bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, 
 // no compositor, and a frame with the live input missing is worse than no frame at all (the caller then
 // falls back to drawing the video in the page). So this overload never takes the CPU fallback.
 bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, const std::vector<TargetSpec>& targets, const VideoLayer& video, std::string& err) {
-    if (!video.w || !video.h || !video.data) return ReadbackConsume(planes, modifier, width, height, format, key, dstW, dstH, targets, err);
+    if (!video.mediaCount && (!video.w || !video.h || !video.data)) return ReadbackConsume(planes, modifier, width, height, format, key, dstW, dstH, targets, err);
     if (!linuxgpu::Available()) {
         err = "video layer requires the GPU readback path";
         return false;
@@ -251,9 +253,10 @@ namespace osrcap {
 // them with DownscaleBgraRaw + ConvertBgraInPlace, so the contract is total either way).
 bool TargetsSupported() { return true; }
 // The GLES convert/scale shaders composite the layer under the page (GPU path only — see the video
-// overload of ReadbackConsume); macOS still draws the frame in the page.
+// overload of ReadbackConsume).
 bool VideoLayerSupported() { return true; }
-bool MediaLayerSupported() { return false; }
+// Media layers are imported as dmabufs and composed on the GL thread (see kFragMedia).
+bool MediaLayerSupported() { return linuxgpu::MediaSupported(); }
 // one GL thread, FIFO, each key holding its own textures and PBO: no context pool to run out of
 size_t MaxConcurrentReadbacks() { return 64; }
 }  // namespace osrcap

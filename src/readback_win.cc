@@ -1571,19 +1571,10 @@ struct ReadbackContext {
             if (mediaDevice != device.Get()) return SetVideoLayerShared(video, pageW, pageH, err);  // the chain was reset
             D3D11_TEXTURE2D_DESC d;
             texs[count]->GetDesc(&d);
-            const float vw = (float)d.Width, vh = (float)d.Height, ow = (float)pageW, oh = (float)pageH;
-            float dst[4] = { 0, 0, ow, oh };
-            float src[4] = { 0, 0, vw, vh };
-            if (m.fit == 2) {
-                // cover: the source cropped to the page's aspect
-                if (vw / vh > ow / oh) { src[2] = vh * ow / oh; src[0] = (vw - src[2]) / 2; }
-                else { src[3] = vw * oh / ow; src[1] = (vh - src[3]) / 2; }
-            } else if (m.fit == 1) {
-                // contain: the whole source in a rectangle of its own aspect, the rest left to the fill
-                if (vw / vh > ow / oh) { dst[3] = ow * vh / vw; dst[1] = (oh - dst[3]) / 2; }
-                else { dst[2] = oh * vw / vh; dst[0] = (ow - dst[2]) / 2; }
-            }
-            float size[4] = { vw, vh, std::min(1.0f, std::max(0.0f, m.alpha)), 0 };
+            const float vw = (float)d.Width, vh = (float)d.Height;
+            float dst[4], src[4];
+            osrcap::FitMediaLayer(vw, vh, (float)pageW, (float)pageH, m.fit, dst, src);
+            float size[4] = { vw, vh, osrcap::MediaLayerAlpha(m.alpha), 0 };
             std::memcpy(count == 0 ? p.dst0 : p.dst1, dst, sizeof(dst));
             std::memcpy(count == 0 ? p.src0 : p.src1, src, sizeof(src));
             std::memcpy(count == 0 ? p.size0 : p.size1, size, sizeof(size));

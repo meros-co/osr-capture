@@ -3,6 +3,7 @@
 // async worker (background thread), so they must be self-contained and thread-safe.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -29,8 +30,16 @@ inline size_t TargetBytes(const TargetSpec& t) {
     if (t.format == 4) return px + 2 * (static_cast<size_t>(t.w / 2) * (t.h / 2));
     return t.format == 1 ? px * 2 : (t.format == 2 ? px * 3 : px * 4);
 }
-// Whether this platform's GPU backend produces TargetSpec outputs (Windows D3D11 today).
+// Whether this platform's GPU backend produces TargetSpec outputs.
 bool TargetsSupported();
+
+// One plane of a Linux dmabuf, as Electron hands it over (its fd stays Electron's).
+struct DmabufPlane {
+    int fd;
+    uint32_t stride;
+    uint64_t offset;
+    uint64_t size;
+};
 
 // How many readbacks this backend can have in flight at once; bounds the depth the caller derives.
 size_t MaxConcurrentReadbacks();
@@ -38,15 +47,37 @@ size_t MaxConcurrentReadbacks();
 // A video frame composited UNDER the captured page in the same pass, so live input never has to travel
 // through the browser's GPU thread to reach the output. `data` is the caller's buffer, read during the
 // consume call only. format: 0 = BGRA, 1 = UYVY, 3 = RGBA. An empty layer (w == 0) composites nothing.
-// Instead of `data` the layer can be built from shared GPU textures (`media`, same handle encoding as a
-// capture source): one decode of a video shown on several outputs, never read back to the CPU. Up to two
-// are drawn bottom to top over the fill color - two while one background fades into another - each
-// fitted to the page (fit 0 = stretch, 1 = contain, 2 = cover) at its own opacity.
+// Instead of `data` the layer can be built from shared GPU textures (`media`, same encoding as a capture
+// source): one decode of a video shown on several outputs, never read back to the CPU. Up to two are drawn
+// bottom to top over the fill color - two while one background fades into another - each fitted to the
+// page (fit 0 = stretch, 1 = contain, 2 = cover) at its own opacity.
 struct MediaLayer {
-    uintptr_t handle = 0;
+    uintptr_t handle = 0;  // Windows: shared D3D11 texture HANDLE; macOS: IOSurface*
     int fit = 0;
     float alpha = 1.0f;
+    // Linux: the frame's dmabuf and its size
+    std::vector<DmabufPlane> planes;
+    uint64_t modifier = 0;
+    uint32_t w = 0;
+    uint32_t h = 0;
 };
+// Where a media layer of vw x vh lands on a page of ow x oh, for its fit: `dst` is the rectangle on the
+// page and `src` the rectangle of the source drawn into it, both x, y, w, h in pixels. Every backend
+// draws with this, so a layer sits in the same place on all three.
+inline void FitMediaLayer(float vw, float vh, float ow, float oh, int fit, float dst[4], float src[4]) {
+    dst[0] = 0; dst[1] = 0; dst[2] = ow; dst[3] = oh;
+    src[0] = 0; src[1] = 0; src[2] = vw; src[3] = vh;
+    if (fit == 2) {
+        // cover: the source cropped to the page's aspect
+        if (vw / vh > ow / oh) { src[2] = vh * ow / oh; src[0] = (vw - src[2]) / 2; }
+        else { src[3] = vw * oh / ow; src[1] = (vh - src[3]) / 2; }
+    } else if (fit == 1) {
+        // contain: the whole source in a rectangle of its own aspect, the rest left to the fill
+        if (vw / vh > ow / oh) { dst[3] = ow * vh / vw; dst[1] = (oh - dst[3]) / 2; }
+        else { dst[2] = oh * vw / vh; dst[0] = (ow - dst[2]) / 2; }
+    }
+}
+inline float MediaLayerAlpha(float a) { return std::min(1.0f, std::max(0.0f, a)); }
 struct VideoLayer {
     const uint8_t* data = nullptr;
     size_t bytes = 0;
@@ -59,7 +90,8 @@ struct VideoLayer {
 };
 // Whether this platform's GPU backend composites a VideoLayer.
 bool VideoLayerSupported();
-// Whether a VideoLayer can be a shared GPU texture (`handle`) on this platform (Windows D3D11 today).
+// Whether a VideoLayer can be built from shared GPU textures (`media`) on this platform: D3D11 on Windows,
+// Metal on macOS, EGL/GLES3 on Linux.
 bool MediaLayerSupported();
 
 // format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (color + alpha), 3 = RGBA (swizzle). All three
@@ -131,12 +163,6 @@ const char* ReadbackBackend();
 #endif  // _WIN32 || __APPLE__
 
 #if defined(__linux__)
-struct DmabufPlane {
-    int fd;
-    uint32_t stride;
-    uint64_t offset;
-    uint64_t size;
-};
 // Single-phase readback. GPU (EGL dmabuf import + shader convert, any modifier) when available, else the
 // mmap+CPU path (LINEAR only). `poolKey` (may be empty) keys the GPU path's cached FBO/PBO per output.
 bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& poolKey, std::vector<uint8_t>& out, std::string& err);

@@ -410,6 +410,39 @@ void main() {
 }
 )GLSL";
 
+// Media layers: up to two shared frames (dmabufs of the hidden media windows) drawn over the fill into a
+// page-sized texture, which the passes above then read as the video layer (format 3, logical R,G,B). Ported
+// from the Windows kMediaComposeHLSL. dst: rect in page pixels; src: rect in source pixels; size: source
+// w, h, opacity. A row of the target is a row of the page, the same convention texelFetch uses everywhere
+// here, and the media frames follow the page's orientation (uMediaFlip mirrors uFlipY).
+const char* kFragMedia = R"GLSL(
+uniform sampler2D uL0;
+uniform sampler2D uL1;
+uniform int uCount;
+uniform int uMediaFlip;
+uniform vec4 uFill;
+uniform vec4 uDst0;
+uniform vec4 uSrc0;
+uniform vec4 uSize0;
+uniform vec4 uDst1;
+uniform vec4 uSrc1;
+uniform vec4 uSize1;
+vec3 mcOver(vec3 c, sampler2D t, vec2 p, vec4 dst, vec4 src, vec4 size) {
+    vec2 f = (p - dst.xy) / dst.zw;
+    if (f.x < 0.0 || f.y < 0.0 || f.x >= 1.0 || f.y >= 1.0) return c;
+    vec2 uv = (src.xy + f * src.zw) / size.xy;
+    if (uMediaFlip == 1) uv.y = 1.0 - uv.y;
+    return mix(c, texture(t, uv).rgb, size.z);
+}
+void main() {
+    vec2 p = gl_FragCoord.xy;
+    vec3 c = uFill.rgb;
+    if (uCount > 0) c = mcOver(c, uL0, p, uDst0, uSrc0, uSize0);
+    if (uCount > 1) c = mcOver(c, uL1, p, uDst1, uSrc1, uSize1);
+    o = vec4(c, 1.0);
+}
+)GLSL";
+
 struct Program {
     GLuint id = 0;
     GLint uTex = -1, uFlipY = -1, uSrcH = -1, uSrcSize = -1, uDstSize = -1;
@@ -464,6 +497,9 @@ struct KeyState {
     // not thrash a single shared allocation). Reallocated only when the texel dimensions change.
     GLuint videoTex = 0;
     int videoTexW = 0, videoTexH = 0;
+    // composed media layers at the page's size (see kFragMedia)
+    GLuint mediaTex = 0, mediaFbo = 0;
+    int mediaW = 0, mediaH = 0;
     std::vector<TargetState> targets;
     GLuint pbo = 0;
     size_t pboCap = 0;
@@ -510,6 +546,7 @@ public:
         return initOk_;
     }
     bool InitOk() const { return initDone_ && initOk_; }
+    bool MediaOk() const { return InitOk() && mediaOk_; }
     const std::string& InitErr() const { return initErr_; }
     const std::string& PlatformName() const { return platformName_; }
     bool HaveModifiers() const { return haveModifiers_; }
@@ -605,6 +642,15 @@ private:
     // called (an empty layer just disarms them), so no draw ever inherits the previous frame's layer.
     bool SetVideoLayerOnThread(KeyState& ks, const VideoLayer& video, std::string& err);
     GLuint DummyVideoTex();  // 1x1 black, so texture unit 1 is always complete even with no layer
+    // An imported media frame, held until the draws reading it are done (see DropMedia).
+    struct MediaHeld {
+        GLuint tex;
+        EGLImageKHR img;
+    };
+    // Import this frame's media layers and draw them into the key's media texture, then arm that texture
+    // as the video layer. Imports land in `held` even on failure, for the caller to drop.
+    bool ComposeMediaOnThread(KeyState& ks, const VideoLayer& video, uint32_t w, uint32_t h, std::vector<MediaHeld>& held, std::string& err);
+    void DropMedia(std::vector<MediaHeld>& held, bool waitGpu);
 
     std::mutex m_;
     std::condition_variable cv_;
@@ -624,6 +670,10 @@ private:
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES_ = nullptr;
     Program pUyvy_, pAlpha_, pBgra_, pRgba_, pScale_, pShare_;
     Program pScaleUyvy_, pScaleAlpha_, pScaleRgba_, pI420Luma_, pI420U_, pI420V_;
+    Program pMedia_;
+    bool mediaOk_ = false;  // pMedia_ compiled; without it the pages keep their own video
+    GLint mcL0_ = -1, mcL1_ = -1, mcCount_ = -1, mcFlip_ = -1, mcFill_ = -1;
+    GLint mcDst_[2] = {-1, -1}, mcSrc_[2] = {-1, -1}, mcSize_[2] = {-1, -1};
     std::map<std::string, KeyState> keys_;
     // the layer state DrawToSized binds; set per consume by SetVideoLayerOnThread
     GLuint videoTex_ = 0, dummyVideoTex_ = 0;
@@ -804,6 +854,24 @@ bool GlThread::InitGl() {
         initErr_ = serr;
         return false;
     }
+    // optional: a driver that cannot build it only loses media layers, not the readback
+    std::string merr;
+    mediaOk_ = CompileProgram(pMedia_, kFragMedia, merr);
+    if (mediaOk_) {
+        mcL0_ = glGetUniformLocation(pMedia_.id, "uL0");
+        mcL1_ = glGetUniformLocation(pMedia_.id, "uL1");
+        mcCount_ = glGetUniformLocation(pMedia_.id, "uCount");
+        mcFlip_ = glGetUniformLocation(pMedia_.id, "uMediaFlip");
+        mcFill_ = glGetUniformLocation(pMedia_.id, "uFill");
+        mcDst_[0] = glGetUniformLocation(pMedia_.id, "uDst0");
+        mcSrc_[0] = glGetUniformLocation(pMedia_.id, "uSrc0");
+        mcSize_[0] = glGetUniformLocation(pMedia_.id, "uSize0");
+        mcDst_[1] = glGetUniformLocation(pMedia_.id, "uDst1");
+        mcSrc_[1] = glGetUniformLocation(pMedia_.id, "uSrc1");
+        mcSize_[1] = glGetUniformLocation(pMedia_.id, "uSize1");
+    } else {
+        std::fprintf(stderr, "[osr-capture] media layer shader unavailable (%s); pages keep their own video\n", merr.c_str());
+    }
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glDisable(GL_BLEND);
     glDisable(GL_DEPTH_TEST);
@@ -904,6 +972,85 @@ bool GlThread::SetVideoLayerOnThread(KeyState& ks, const VideoLayer& video, std:
     videoH_ = (int)video.h;
     videoFormat_ = video.format;
     return true;
+}
+
+bool GlThread::ComposeMediaOnThread(KeyState& ks, const VideoLayer& video, uint32_t w, uint32_t h, std::vector<MediaHeld>& held, std::string& err) {
+    videoOn_ = false;
+    videoTex_ = 0;
+    videoW_ = videoH_ = videoFormat_ = 0;
+    if (!mediaOk_) {
+        err = "media layer shader unavailable";
+        return false;
+    }
+    float dst[2][4] = {}, src[2][4] = {}, size[2][4] = {};
+    const int count = video.mediaCount < 2 ? video.mediaCount : 2;
+    for (int i = 0; i < count; ++i) {
+        const MediaLayer& m = video.media[i];
+        EGLImageKHR img = ImportDmabuf(m.planes, m.modifier, m.w, m.h, err);
+        if (img == EGL_NO_IMAGE_KHR) return false;
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        D().texCreated.fetch_add(1);
+        held.push_back({tex, img});
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        for (int e = 0; e < 8 && glGetError() != GL_NO_ERROR; ++e) {
+        }
+        glEGLImageTargetTexture2DOES_(GL_TEXTURE_2D, (GLeglImageOES)img);
+        if (glGetError() != GL_NO_ERROR) {
+            err = "glEGLImageTargetTexture2DOES failed for a media layer";
+            return false;
+        }
+        FitMediaLayer((float)m.w, (float)m.h, (float)w, (float)h, m.fit, dst[i], src[i]);
+        size[i][0] = (float)m.w;
+        size[i][1] = (float)m.h;
+        size[i][2] = MediaLayerAlpha(m.alpha);
+    }
+    if (!EnsureTarget(ks.mediaTex, ks.mediaFbo, ks.mediaW, ks.mediaH, (int)w, (int)h, err)) return false;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ks.mediaFbo);
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glUseProgram(pMedia_.id);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, held[0].tex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, held[count > 1 ? 1 : 0].tex);
+    glActiveTexture(GL_TEXTURE0);
+    glUniform1i(mcL0_, 0);
+    glUniform1i(mcL1_, 1);
+    glUniform1i(mcCount_, count);
+    glUniform1i(mcFlip_, flipY_);
+    glUniform4f(mcFill_, video.fillR / 255.0f, video.fillG / 255.0f, video.fillB / 255.0f, 1.0f);
+    for (int i = 0; i < 2; ++i) {
+        glUniform4fv(mcDst_[i], 1, dst[i]);
+        glUniform4fv(mcSrc_[i], 1, src[i]);
+        glUniform4fv(mcSize_[i], 1, size[i]);
+    }
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    videoTex_ = ks.mediaTex;
+    videoOn_ = true;
+    videoW_ = (int)w;
+    videoH_ = (int)h;
+    videoFormat_ = 3;  // written as logical R,G,B, which is what format 3 reads
+    return true;
+}
+
+// Electron may hand a media frame's buffer out again once the worker releases it, so on a path that has
+// not already waited for the draws, wait before letting go of the imports.
+void GlThread::DropMedia(std::vector<MediaHeld>& held, bool waitGpu) {
+    if (held.empty()) return;
+    if (waitGpu) glFinish();
+    for (const MediaHeld& m : held) {
+        glDeleteTextures(1, &m.tex);
+        D().texDestroyed.fetch_add(1);
+        eglDestroyImageKHR_(dpy_, m.img);
+        D().imgDestroyed.fetch_add(1);
+    }
+    held.clear();
 }
 
 EGLImageKHR GlThread::ImportDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t w, uint32_t h, std::string& err) {
@@ -1031,7 +1178,10 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     DropPending(ks);  // stale consume without a finish (shouldn't happen with single-in-flight per key)
 
     // ---- video layer (before the import, so a bad layer costs no EGLImage) --------------------------------
-    if (!SetVideoLayerOnThread(ks, video, err)) {
+    std::vector<MediaHeld> mediaHeld;
+    const bool layerOk = video.mediaCount ? ComposeMediaOnThread(ks, video, w, h, mediaHeld, err) : SetVideoLayerOnThread(ks, video, err);
+    if (!layerOk) {
+        DropMedia(mediaHeld, true);
         Trace8(seq, key, "videoLayer=FAIL");
         return false;
     }
@@ -1039,6 +1189,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     // ---- import ------------------------------------------------------------------------------------------
     EGLImageKHR img = ImportDmabuf(planes, modifier, w, h, err);
     if (img == EGL_NO_IMAGE_KHR) {
+        DropMedia(mediaHeld, true);
         importFailed = true;
         Trace8(seq, key, "import=FAIL");
         return false;
@@ -1059,6 +1210,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
         D().texDestroyed.fetch_add(1);
         eglDestroyImageKHR_(dpy_, img);
         D().imgDestroyed.fetch_add(1);
+        DropMedia(mediaHeld, true);
         err = "glEGLImageTargetTexture2DOES failed";
         importFailed = true;
         Trace8(seq, key, "import=ok bind=FAIL released(img+tex)");
@@ -1156,6 +1308,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
         D().texDestroyed.fetch_add(1);
         eglDestroyImageKHR_(dpy_, img);
         D().imgDestroyed.fetch_add(1);
+        DropMedia(mediaHeld, true);
         Trace8(seq, key, "import=ok targets=FAIL released(img+tex)");
         return false;
     }
@@ -1230,6 +1383,8 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
     D().texDestroyed.fetch_add(1);
     eglDestroyImageKHR_(dpy_, img);
     D().imgDestroyed.fetch_add(1);
+    // the compose draw came before the fenced draws; only a timed-out fence leaves it unconfirmed
+    DropMedia(mediaHeld, r != GL_ALREADY_SIGNALED && r != GL_CONDITION_SATISFIED);
     if (D().enabled) {
         GLenum ge = glGetError();
         if (ge != GL_NO_ERROR) D().lastGlErr.store((uint32_t)ge);
@@ -1318,6 +1473,14 @@ void GlThread::ReleaseKeyOnThread(const std::string& key) {
     if (ks.texAlpha) glDeleteTextures(1, &ks.texAlpha);
     if (ks.texScaled) glDeleteTextures(1, &ks.texScaled);
     if (ks.texShare) glDeleteTextures(1, &ks.texShare);
+    if (ks.mediaFbo) glDeleteFramebuffers(1, &ks.mediaFbo);
+    if (ks.mediaTex) {
+        if (videoTex_ == ks.mediaTex) {
+            videoTex_ = 0;
+            videoOn_ = false;
+        }
+        glDeleteTextures(1, &ks.mediaTex);
+    }
     if (ks.videoTex) {
         if (videoTex_ == ks.videoTex) {  // never leave the draw state pointing at a deleted texture
             videoTex_ = 0;
@@ -1388,6 +1551,8 @@ bool Init() {
 }
 
 bool Initialized() { return GlThread::Instance().InitOk(); }
+
+bool MediaSupported() { return Init() && GlThread::Instance().MediaOk(); }
 
 bool Available() {
     GlThread& t = GlThread::Instance();
