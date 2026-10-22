@@ -755,6 +755,121 @@ void SCI420Main(uint3 tid : SV_DispatchThreadID) {
 }
 )HLSL";
 
+// SDI card formats 5-8 (osr_readback.h), with the same box filter and compositing as the I420 target.
+const char* kScaleCardHLSL = R"HLSL(
+Texture2D<float4> gSrc : register(t0);
+RWByteAddressBuffer gDst : register(u0);
+cbuffer ScParams : register(b0) {
+    uint gSrcW; uint gSrcH; uint gDstW; uint gDstH;
+    uint gFormat; uint gUyvySize; uint gPad0; uint gPad1;
+    uint gVideoOn; uint gVideoW; uint gVideoH; uint gVideoFormat;
+};
+Texture2D<float4> gVideo : register(t1);
+float3 videoAt(uint x, uint y, uint dstW, uint dstH) {
+    uint vx = (dstW == gVideoW) ? x : x * gVideoW / dstW;
+    uint vy = (dstH == gVideoH) ? y : y * gVideoH / dstH;
+    // 0 = BGRA (the texture's own order), 3 = RGBA (red and blue arrive swapped), 1 = UYVY below
+    if (gVideoFormat == 0) return gVideo.Load(int3(vx, vy, 0)).rgb;
+    if (gVideoFormat == 3) return gVideo.Load(int3(vx, vy, 0)).bgr;
+    float4 s = gVideo.Load(int3(vx / 2, vy, 0));
+    float luma = ((vx & 1) == 0) ? s.g : s.a;
+    float yy = (luma - 16.0 / 255.0) * (255.0 / 219.0);
+    // the layer texture is BGRA, so the UYVY bytes U,Y0,V,Y1 arrive as .b,.g,.r,.a
+    float u = (s.b - 128.0 / 255.0) * (255.0 / 224.0);
+    float v = (s.r - 128.0 / 255.0) * (255.0 / 224.0);
+    float bt = (gVideoH >= 720) ? 1.0 : 0.0;
+    float kr = lerp(1.402, 1.5748, bt), kb = lerp(1.772, 1.8556, bt);
+    float gu = lerp(0.344136, 0.1873, bt), gv = lerp(0.714136, 0.4681, bt);
+    return saturate(float3(yy + kr * v, yy - gu * u - gv * v, yy + kb * u));
+}
+float4 overVideo(float4 page, uint x, uint y, uint dstW, uint dstH) {
+    if (gVideoOn == 0) return page;
+    if (page.a >= 0.999) return page;
+    return float4(page.rgb + videoAt(x, y, dstW, dstH) * (1.0 - page.a), 1.0);
+}
+float4 boxAvg(uint dx, uint dy) {
+    if (gSrcW == gDstW && gSrcH == gDstH) return overVideo(gSrc.Load(int3(dx, dy, 0)), dx, dy, gDstW, gDstH);
+    uint sx0 = dx * gSrcW / gDstW;
+    uint sx1 = (dx + 1) * gSrcW / gDstW; if (sx1 <= sx0) sx1 = sx0 + 1;
+    uint sy0 = dy * gSrcH / gDstH;
+    uint sy1 = (dy + 1) * gSrcH / gDstH; if (sy1 <= sy0) sy1 = sy0 + 1;
+    float4 acc = float4(0, 0, 0, 0);
+    uint cnt = 0;
+    for (uint y = sy0; y < sy1; ++y) {
+        for (uint x = sx0; x < sx1; ++x) { acc += gSrc.Load(int3(x, y, 0)); ++cnt; }
+    }
+    return overVideo(acc / cnt, dx, dy, gDstW, gDstH);
+}
+uint lumaOf(float4 c) {
+    int r = (int)(c.r * 255.0 + 0.5), g = (int)(c.g * 255.0 + 0.5), b = (int)(c.b * 255.0 + 0.5);
+    return (uint)clamp(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16, 16, 235);
+}
+int3 rgb8(float4 c) { return int3((int)(c.r * 255.0 + 0.5), (int)(c.g * 255.0 + 0.5), (int)(c.b * 255.0 + 0.5)); }
+// coefficients: CardCoefficients in osr_readback.h (x1024, every sum non-negative)
+int3 kY() {
+    if (gFormat == 7) return int3(748, 2516, 254);
+    if (gFormat == 8) return int3(1052, 2065, 401);
+    if (gFormat == 6) return int3(263, 516, 100);
+    return int3(187, 629, 63);
+}
+int3 kB() {
+    if (gFormat == 7) return int3(-412, -1387, 1799);
+    if (gFormat == 8) return int3(-607, -1192, 1799);
+    if (gFormat == 6) return int3(-152, -298, 450);
+    return int3(-103, -347, 450);
+}
+int3 kR() {
+    if (gFormat == 7) return int3(1799, -1634, -165);
+    if (gFormat == 8) return int3(1799, -1506, -293);
+    if (gFormat == 6) return int3(450, -377, -73);
+    return int3(450, -409, -41);
+}
+int yOff() { return gFormat >= 7 ? 64 : 16; }
+int cOff() { return gFormat >= 7 ? 512 : 128; }
+int lumaC(int3 p) { int3 k = kY(); return ((k.x * p.x + k.y * p.y + k.z * p.z + 512) >> 10) + yOff(); }
+int chromaC(int3 k, int3 p) { return (k.x * p.x + k.y * p.y + k.z * p.z + cOff() * 1024 + 512) >> 10; }
+// 5/6: one thread per pixel pair, one 'U Y0 V Y1' word. 7/8: one thread per 6-pixel v210 group, four words,
+// with the row padded to 128 bytes in black.
+[numthreads(8, 8, 1)]
+void SCCardMain(uint3 tid : SV_DispatchThreadID) {
+    uint y = tid.y;
+    if (y >= gDstH) return;
+    if (gFormat == 5 || gFormat == 6) {
+        uint px = tid.x * 2;
+        if (px >= gDstW) return;
+        int3 p0 = rgb8(boxAvg(px, y));
+        int3 p1 = (px + 1 < gDstW) ? rgb8(boxAvg(px + 1, y)) : p0;
+        int3 pa = (p0 + p1 + 1) >> 1;
+        uint word = (uint)chromaC(kB(), pa) | ((uint)lumaC(p0) << 8) | ((uint)chromaC(kR(), pa) << 16) | ((uint)lumaC(p1) << 24);
+        gDst.Store(y * gDstW * 2 + px * 2, word);
+        return;
+    }
+    uint rowBytes = ((gDstW + 47) / 48) * 128;
+    uint g = tid.x;
+    if (g * 16 >= rowBytes) return;
+    int ys[6];
+    int3 ps[6];
+    [unroll] for (uint i = 0; i < 6; ++i) {
+        uint x = g * 6 + i;
+        ps[i] = x < gDstW ? rgb8(boxAvg(x, y)) : int3(0, 0, 0);
+        ys[i] = x < gDstW ? lumaC(ps[i]) : yOff();
+    }
+    int cbs[3];
+    int crs[3];
+    [unroll] for (uint j = 0; j < 3; ++j) {
+        uint x0 = g * 6 + j * 2;
+        int3 pa = (x0 + 1 < gDstW) ? ((ps[j * 2] + ps[j * 2 + 1] + 1) >> 1) : ps[j * 2];
+        cbs[j] = x0 < gDstW ? chromaC(kB(), pa) : cOff();
+        crs[j] = x0 < gDstW ? chromaC(kR(), pa) : cOff();
+    }
+    uint base = y * rowBytes + g * 16;
+    gDst.Store(base, (uint)cbs[0] | ((uint)ys[0] << 10) | ((uint)crs[0] << 20));
+    gDst.Store(base + 4, (uint)ys[1] | ((uint)cbs[1] << 10) | ((uint)ys[2] << 20));
+    gDst.Store(base + 8, (uint)crs[1] | ((uint)ys[3] << 10) | ((uint)cbs[2] << 20));
+    gDst.Store(base + 12, (uint)ys[4] | ((uint)crs[2] << 10) | ((uint)ys[5] << 20));
+}
+)HLSL";
+
 struct ScParams {
     uint32_t srcW;
     uint32_t srcH;
@@ -964,6 +1079,7 @@ struct ReadbackContext {
     // per-consumer targets (osrcap::TargetSpec): downscale+convert in one pass, one slot per target
     ComPtr<ID3D11ComputeShader> scShader;
     ComPtr<ID3D11ComputeShader> scI420Shader;
+    ComPtr<ID3D11ComputeShader> scCardShader;
     ComPtr<ID3D11Buffer> scParamsCb;
     struct TargetSlot {
         ComPtr<ID3D11Buffer> buf;
@@ -1403,7 +1519,7 @@ struct ReadbackContext {
     }
 
     bool EnsureScShader() {
-        if (scShader && scI420Shader) return true;
+        if (scShader && scI420Shader && scCardShader) return true;
         ComPtr<ID3DBlob> blob, errBlob;
         HRESULT hr = D3DCompile(kScaleConvertHLSL, strlen(kScaleConvertHLSL), "scaleconvert.hlsl", nullptr, nullptr, "SCMain", "cs_5_0", 0, 0, &blob, &errBlob);
         if (FAILED(hr)) return false;
@@ -1412,6 +1528,10 @@ struct ReadbackContext {
         hr = D3DCompile(kScaleI420HLSL, strlen(kScaleI420HLSL), "scalei420.hlsl", nullptr, nullptr, "SCI420Main", "cs_5_0", 0, 0, &blob2, &errBlob2);
         if (FAILED(hr)) return false;
         if (FAILED(device->CreateComputeShader(blob2->GetBufferPointer(), blob2->GetBufferSize(), nullptr, &scI420Shader))) return false;
+        ComPtr<ID3DBlob> blob3, errBlob3;
+        hr = D3DCompile(kScaleCardHLSL, strlen(kScaleCardHLSL), "scalecard.hlsl", nullptr, nullptr, "SCCardMain", "cs_5_0", 0, 0, &blob3, &errBlob3);
+        if (FAILED(hr)) return false;
+        if (FAILED(device->CreateComputeShader(blob3->GetBufferPointer(), blob3->GetBufferSize(), nullptr, &scCardShader))) return false;
         if (scParamsCb) return true;
         D3D11_BUFFER_DESC cb = {};
         cb.ByteWidth = sizeof(ScParams);
@@ -1656,11 +1776,13 @@ struct ReadbackContext {
         ID3D11UnorderedAccessView* uavs[] = { slot.uav.Get() };
         ID3D11Buffer* cbs[] = { scParamsCb.Get() };
         const bool i420 = t.format == 4;
-        context->CSSetShader(i420 ? scI420Shader.Get() : scShader.Get(), nullptr, 0);
+        const bool card = t.format >= 5 && t.format <= 8;
+        context->CSSetShader(i420 ? scI420Shader.Get() : card ? scCardShader.Get() : scShader.Get(), nullptr, 0);
         context->CSSetShaderResources(0, 2, srvs);
         context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
         context->CSSetConstantBuffers(0, 1, cbs);
         if (i420) context->Dispatch((t.w + 7) / 8, (t.h + 1) / 2, 1);
+        else if (t.format == 7 || t.format == 8) context->Dispatch(((uint32_t)(osrcap::V210RowBytes(t.w) / 16) + 7) / 8, (t.h + 7) / 8, 1);
         else context->Dispatch(((t.w + 1) / 2 + 7) / 8, (t.h + 7) / 8, 1);
         ID3D11ShaderResourceView* nullSrv[] = { nullptr, nullptr };
         ID3D11UnorderedAccessView* nullUav[] = { nullptr };

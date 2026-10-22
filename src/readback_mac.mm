@@ -307,6 +307,57 @@ kernel void scaleI420(texture2d<float, access::read> src [[texture(0)]],
     }
 }
 
+// SDI card formats 5-8 (osr_readback.h: CardCoefficients), ported from kScaleCardHLSL in readback_win.cc.
+inline int3 rgb8(float4 c) { return int3(int(c.r * 255.0f + 0.5f), int(c.g * 255.0f + 0.5f), int(c.b * 255.0f + 0.5f)); }
+inline int3 cardKY(uint f) { return f == 7 ? int3(748, 2516, 254) : f == 8 ? int3(1052, 2065, 401) : f == 6 ? int3(263, 516, 100) : int3(187, 629, 63); }
+inline int3 cardKB(uint f) { return f == 7 ? int3(-412, -1387, 1799) : f == 8 ? int3(-607, -1192, 1799) : f == 6 ? int3(-152, -298, 450) : int3(-103, -347, 450); }
+inline int3 cardKR(uint f) { return f == 7 ? int3(1799, -1634, -165) : f == 8 ? int3(1799, -1506, -293) : f == 6 ? int3(450, -377, -73) : int3(450, -409, -41); }
+inline int cardLuma(uint f, int3 p) { int3 k = cardKY(f); return ((k.x * p.x + k.y * p.y + k.z * p.z + 512) >> 10) + (f >= 7 ? 64 : 16); }
+inline int cardChroma(uint f, int3 k, int3 p) { return (k.x * p.x + k.y * p.y + k.z * p.z + (f >= 7 ? 512 : 128) * 1024 + 512) >> 10; }
+// 5/6: one thread per pixel pair, one 'U Y0 V Y1' word. 7/8: one thread per 6-pixel v210 group, four words,
+// the row padded to 128 bytes in black.
+kernel void scaleCard(texture2d<float, access::read> src [[texture(0)]],
+                      texture2d<float, access::read> vid [[texture(1)]],
+                      device uint* dst [[buffer(0)]],
+                      constant ScParams& p [[buffer(1)]],
+                      uint2 tid [[thread_position_in_grid]]) {
+    uint y = tid.y;
+    if (y >= p.dstH) return;
+    uint f = p.format;
+    if (f == 5 || f == 6) {
+        uint px = tid.x * 2;
+        if (px >= p.dstW) return;
+        int3 p0 = rgb8(boxAvg(src, vid, p, px, y));
+        int3 p1 = (px + 1 < p.dstW) ? rgb8(boxAvg(src, vid, p, px + 1, y)) : p0;
+        int3 pa = (p0 + p1 + 1) >> 1;
+        dst[(y * p.dstW * 2 + px * 2) >> 2] = uint(cardChroma(f, cardKB(f), pa)) | (uint(cardLuma(f, p0)) << 8) | (uint(cardChroma(f, cardKR(f), pa)) << 16) | (uint(cardLuma(f, p1)) << 24);
+        return;
+    }
+    uint rowBytes = ((p.dstW + 47) / 48) * 128;
+    uint g = tid.x;
+    if (g * 16 >= rowBytes) return;
+    int ys[6];
+    int3 ps[6];
+    for (uint i = 0; i < 6; ++i) {
+        uint x = g * 6 + i;
+        ps[i] = x < p.dstW ? rgb8(boxAvg(src, vid, p, x, y)) : int3(0);
+        ys[i] = x < p.dstW ? cardLuma(f, ps[i]) : 64;
+    }
+    int cbs[3];
+    int crs[3];
+    for (uint j = 0; j < 3; ++j) {
+        uint x0 = g * 6 + j * 2;
+        int3 pa = (x0 + 1 < p.dstW) ? ((ps[j * 2] + ps[j * 2 + 1] + 1) >> 1) : ps[j * 2];
+        cbs[j] = x0 < p.dstW ? cardChroma(f, cardKB(f), pa) : 512;
+        crs[j] = x0 < p.dstW ? cardChroma(f, cardKR(f), pa) : 512;
+    }
+    uint base = (y * rowBytes + g * 16) >> 2;
+    dst[base] = uint(cbs[0]) | (uint(ys[0]) << 10) | (uint(crs[0]) << 20);
+    dst[base + 1] = uint(ys[1]) | (uint(cbs[1]) << 10) | (uint(ys[2]) << 20);
+    dst[base + 2] = uint(crs[1]) | (uint(ys[3]) << 10) | (uint(cbs[2]) << 20);
+    dst[base + 3] = uint(ys[4]) | (uint(crs[2]) << 10) | (uint(ys[5]) << 20);
+}
+
 // Media layers: up to two shared frames (IOSurfaces of the hidden media windows) drawn over the fill into
 // a page-sized texture, which the passes above then read as the video layer. Ported from the Windows
 // kMediaComposeHLSL. dst: rect in page pixels; src: rect in source pixels; size: source w, h, opacity.
@@ -388,6 +439,7 @@ struct MetalCtx {
     id<MTLComputePipelineState> psoScaleI420 = nil;
     id<MTLComputePipelineState> psoShare = nil;
     id<MTLComputePipelineState> psoMedia = nil;  // nil: no media layers here, the pages keep their video
+    id<MTLComputePipelineState> psoCard = nil;
     // the shared scale source, reallocated only when the size it needs changes
     id<MTLTexture> shareTex = nil;
     uint32_t shareW = 0, shareH = 0;
@@ -437,6 +489,7 @@ MetalCtx& Ctx() {
             ctx.psoShare = pso("shareScale");
             ctx.psoScaleI420 = pso("scaleI420");
             ctx.psoMedia = pso("mediaCompose");
+            ctx.psoCard = pso("scaleCard");
             // An IOSurface-backed texture must use Shared storage on unified-memory (Apple Silicon) devices
             // and Managed on discrete/Intel ones. The same rule applies to the CPU-written video layer.
             ctx.ioSurfaceStorage = ctx.device.hasUnifiedMemory ? MTLStorageModeShared : MTLStorageModeManaged;
@@ -447,7 +500,7 @@ MetalCtx& Ctx() {
             dd.usage = MTLTextureUsageShaderRead;
             dd.storageMode = ctx.ioSurfaceStorage;
             ctx.dummyVideo = [ctx.device newTextureWithDescriptor:dd];
-            if (!ctx.queue || !ctx.psoConvert || !ctx.psoDownscale || !ctx.psoSwizzle || !ctx.psoScaleConvert || !ctx.psoScaleI420 || !ctx.dummyVideo) {
+            if (!ctx.queue || !ctx.psoConvert || !ctx.psoDownscale || !ctx.psoSwizzle || !ctx.psoScaleConvert || !ctx.psoScaleI420 || !ctx.psoCard || !ctx.dummyVideo) {
                 g_backend = "iosurface-cpu";
                 fprintf(stderr, "[READBACK] Metal pipeline init failed -> CPU IOSurface path\n");
                 fflush(stderr);
@@ -754,12 +807,14 @@ bool RunGpu(IOSurfaceRef surface, uint32_t width, uint32_t height, int format, u
             ScParams p{viaShare ? shareW : width, viaShare ? shareH : height, t.w, t.h, static_cast<uint32_t>(t.format), t.w * 2 * t.h, viaShare ? vidOff : vid};
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             const bool i420 = (t.format == 4);
-            [enc setComputePipelineState:(i420 ? ctx.psoScaleI420 : ctx.psoScaleConvert)];
+            const bool card = (t.format >= 5 && t.format <= 8);
+            const bool v210 = (t.format == 7 || t.format == 8);
+            [enc setComputePipelineState:(i420 ? ctx.psoScaleI420 : card ? ctx.psoCard : ctx.psoScaleConvert)];
             [enc setTexture:(viaShare ? shareTex : tex) atIndex:0];
             [enc setTexture:vidTex atIndex:1];
             [enc setBuffer:targetBufs[i] offset:0 atIndex:0];
             [enc setBytes:&p length:sizeof(p) atIndex:1];
-            const NSUInteger gx = i420 ? (t.w + 7) / 8 : (t.w + 1) / 2;
+            const NSUInteger gx = i420 ? (t.w + 7) / 8 : v210 ? static_cast<NSUInteger>(V210RowBytes(t.w) / 16) : (t.w + 1) / 2;
             const NSUInteger gy = i420 ? (t.h + 1) / 2 : t.h;
             [enc dispatchThreads:MTLSizeMake(gx, gy, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
             [enc endEncoding];

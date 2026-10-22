@@ -366,6 +366,66 @@ void main() {
 }
 )GLSL";
 
+// SDI card formats 5-8 (osr_readback.h: CardCoefficients), ported from kScaleCardHLSL in readback_win.cc.
+// Compiled four times, each with CARD_TEN / CARD_601 defined ahead of it. Every sum here is non-negative, so
+// >> is a plain floor. 8-bit: one RGBA8 texel per pixel pair = the 'U Y0 V Y1' bytes. v210: one texel per
+// 32-bit word (its little-endian bytes), four per 6-pixel group, the row padded to 128 bytes in black.
+const char* kFragCard = R"GLSL(
+#if CARD_TEN
+#if CARD_601
+const ivec3 KY = ivec3(1052, 2065, 401); const ivec3 KB = ivec3(-607, -1192, 1799); const ivec3 KR = ivec3(1799, -1506, -293);
+#else
+const ivec3 KY = ivec3(748, 2516, 254); const ivec3 KB = ivec3(-412, -1387, 1799); const ivec3 KR = ivec3(1799, -1634, -165);
+#endif
+const int YOFF = 64; const int COFF = 512;
+#else
+#if CARD_601
+const ivec3 KY = ivec3(263, 516, 100); const ivec3 KB = ivec3(-152, -298, 450); const ivec3 KR = ivec3(450, -377, -73);
+#else
+const ivec3 KY = ivec3(187, 629, 63); const ivec3 KB = ivec3(-103, -347, 450); const ivec3 KR = ivec3(450, -409, -41);
+#endif
+const int YOFF = 16; const int COFF = 128;
+#endif
+ivec3 RGB8(vec4 c) { return ivec3(int(c.r * 255.0 + 0.5), int(c.g * 255.0 + 0.5), int(c.b * 255.0 + 0.5)); }
+int LY(ivec3 q) { return ((KY.x * q.x + KY.y * q.y + KY.z * q.z + 512) >> 10) + YOFF; }
+int LC(ivec3 k, ivec3 q) { return (k.x * q.x + k.y * q.y + k.z * q.z + COFF * 1024 + 512) >> 10; }
+void main() {
+    ivec2 d = ivec2(gl_FragCoord.xy);
+    int w = uDstSize.x;
+#if CARD_TEN
+    int g = d.x / 4;
+    int word = d.x - g * 4;
+    int ys[6];
+    ivec3 ps[6];
+    for (int i = 0; i < 6; ++i) {
+        int x = g * 6 + i;
+        ps[i] = x < w ? RGB8(PIX(x, d.y)) : ivec3(0);
+        ys[i] = x < w ? LY(ps[i]) : YOFF;
+    }
+    int cbs[3];
+    int crs[3];
+    for (int j = 0; j < 3; ++j) {
+        int x0 = g * 6 + j * 2;
+        ivec3 pa = (x0 + 1 < w) ? ((ps[j * 2] + ps[j * 2 + 1] + 1) >> 1) : ps[j * 2];
+        cbs[j] = x0 < w ? LC(KB, pa) : COFF;
+        crs[j] = x0 < w ? LC(KR, pa) : COFF;
+    }
+    uint v;
+    if (word == 0) v = uint(cbs[0]) | (uint(ys[0]) << 10) | (uint(crs[0]) << 20);
+    else if (word == 1) v = uint(ys[1]) | (uint(cbs[1]) << 10) | (uint(ys[2]) << 20);
+    else if (word == 2) v = uint(crs[1]) | (uint(ys[3]) << 10) | (uint(cbs[2]) << 20);
+    else v = uint(ys[4]) | (uint(crs[2]) << 10) | (uint(ys[5]) << 20);
+    o = vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), float(v >> 24)) / 255.0;
+#else
+    int x0 = d.x * 2;
+    ivec3 p0 = RGB8(PIX(min(x0, w - 1), d.y));
+    ivec3 p1 = RGB8(PIX(min(x0 + 1, w - 1), d.y));
+    ivec3 pa = (p0 + p1 + 1) >> 1;
+    o = vec4(float(LC(KB, pa)), float(LY(p0)), float(LC(KR, pa)), float(LY(p1))) / 255.0;
+#endif
+}
+)GLSL";
+
 // Chroma helpers shared by the U and V shaders: CHROMA(cx, cy) averages the 2x2 destination pixels the
 // chroma sample covers, each of them itself a BOX of the source composited over the video layer (the
 // composite is per destination pixel, before the 2x2 average — as in kScaleI420HLSL).
@@ -671,6 +731,7 @@ private:
     Program pUyvy_, pAlpha_, pBgra_, pRgba_, pScale_, pShare_;
     Program pScaleUyvy_, pScaleAlpha_, pScaleRgba_, pI420Luma_, pI420U_, pI420V_;
     Program pMedia_;
+    Program pCard_[4];  // formats 5-8
     bool mediaOk_ = false;  // pMedia_ compiled; without it the pages keep their own video
     GLint mcL0_ = -1, mcL1_ = -1, mcCount_ = -1, mcFlip_ = -1, mcFill_ = -1;
     GLint mcDst_[2] = {-1, -1}, mcSrc_[2] = {-1, -1}, mcSize_[2] = {-1, -1};
@@ -853,6 +914,13 @@ bool GlThread::InitGl() {
         !CompileProgram(pI420V_, i420v.c_str(), serr)) {
         initErr_ = serr;
         return false;
+    }
+    for (int f = 0; f < 4; ++f) {
+        const std::string body = std::string("#define CARD_TEN ") + (f >= 2 ? "1" : "0") + "\n#define CARD_601 " + (f % 2 ? "1" : "0") + "\n" + kFragCard;
+        if (!CompileProgram(pCard_[f], body.c_str(), serr)) {
+            initErr_ = serr;
+            return false;
+        }
     }
     // optional: a driver that cannot build it only loses media layers, not the readback
     std::string merr;
@@ -1165,7 +1233,7 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
         return false;
     }
     for (const TargetSpec& t : targets) {
-        if ((t.format == 1 || t.format == 2) && (t.w & 1)) {
+        if ((t.format == 1 || t.format == 2 || t.format == 5 || t.format == 6) && (t.w & 1)) {
             err = "odd target width unsupported for UYVY/UYVA";
             return false;
         }
@@ -1280,6 +1348,12 @@ bool GlThread::ConsumeOnThread(const std::vector<DmabufPlane>& planes, uint64_t 
         if (t.format == 1 || t.format == 2) {
             plane(0, tw / 2, th, (uint32_t)tw * 2, pScaleUyvy_);
             if (t.format == 2) plane(1, (tw + 3) / 4, th, (uint32_t)tw, pScaleAlpha_);
+        } else if (t.format >= 5 && t.format <= 8) {
+            if (t.format <= 6) plane(0, tw / 2, th, (uint32_t)tw * 2, pCard_[t.format - 5]);
+            else {
+                const uint32_t rowBytes = (uint32_t)V210RowBytes(t.w);
+                plane(0, (int)(rowBytes / 4), th, rowBytes, pCard_[t.format - 5]);
+            }
         } else if (t.format == 4) {
             const int cw = tw / 2;
             plane(0, (tw + 3) / 4, th, (uint32_t)tw, pI420Luma_);

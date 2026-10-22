@@ -665,6 +665,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("maxConcurrentReadbacks", Napi::Number::New(env, static_cast<double>(osrcap::MaxConcurrentReadbacks())));
     exports.Set("videoLayerSupported", Napi::Boolean::New(env, osrcap::VideoLayerSupported()));
     exports.Set("mediaLayerSupported", Napi::Boolean::New(env, osrcap::MediaLayerSupported()));
+    // targets (and convertBgraToCard) take the SDI card formats 5-8 (osr_readback.h)
+    exports.Set("cardFormats", Napi::Boolean::New(env, true));
 #endif
 #if defined(_WIN32)
     exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));

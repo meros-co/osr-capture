@@ -8,6 +8,7 @@
 // convertBgraToUyvy(bgra: Buffer, width, height) => Buffer  // width*2*height (opaque)
 // convertBgraToUyva(bgra: Buffer, width, height) => Buffer  // width*2*height UYVY + width*height alpha
 #include "convert.h"
+#include "osr_readback.h"
 
 #include <napi.h>
 
@@ -94,6 +95,60 @@ static void UyvaInto(const uint8_t* bgra, uint32_t width, uint32_t height, uint8
     }
 }
 
+// SDI card formats (osr_readback.h): the reference the GPU kernels match
+static void CardInto(const uint8_t* src, uint32_t width, uint32_t height, int format, uint8_t* dst) {
+    const CardCoeffs k = CardCoefficients(format);
+    auto luma = [&](int r, int g, int b) { return ((k.ky[0] * r + k.ky[1] * g + k.ky[2] * b + 512) >> 10) + k.yOff; };
+    auto cb = [&](int r, int g, int b) { return (k.kb[0] * r + k.kb[1] * g + k.kb[2] * b + k.cOff * 1024 + 512) >> 10; };
+    auto cr = [&](int r, int g, int b) { return (k.kr[0] * r + k.kr[1] * g + k.kr[2] * b + k.cOff * 1024 + 512) >> 10; };
+    if (format == 5 || format == 6) {
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* s = src + static_cast<size_t>(y) * width * 4;
+            uint8_t* d = dst + static_cast<size_t>(y) * width * 2;
+            for (uint32_t x = 0; x < width; x += 2) {
+                const uint8_t* p1 = (x + 1 < width) ? s + 4 : s;
+                const int r0 = s[2], g0 = s[1], b0 = s[0], r1 = p1[2], g1 = p1[1], b1 = p1[0];
+                const int ra = (r0 + r1 + 1) >> 1, ga = (g0 + g1 + 1) >> 1, ba = (b0 + b1 + 1) >> 1;
+                d[0] = static_cast<uint8_t>(cb(ra, ga, ba));
+                d[1] = static_cast<uint8_t>(luma(r0, g0, b0));
+                d[2] = static_cast<uint8_t>(cr(ra, ga, ba));
+                d[3] = static_cast<uint8_t>(luma(r1, g1, b1));
+                s += 8;
+                d += 4;
+            }
+        }
+        return;
+    }
+    const size_t rowBytes = V210RowBytes(width);
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* row = src + static_cast<size_t>(y) * width * 4;
+        uint32_t* d = reinterpret_cast<uint32_t*>(dst + static_cast<size_t>(y) * rowBytes);
+        const uint32_t groups = static_cast<uint32_t>(rowBytes / 16);
+        for (uint32_t g = 0; g < groups; ++g) {
+            int ys[6], cbs[3], crs[3];
+            for (int i = 0; i < 6; ++i) {
+                const uint32_t x = g * 6 + i;
+                ys[i] = x < width ? luma(row[x * 4 + 2], row[x * 4 + 1], row[x * 4]) : k.yOff;
+            }
+            for (int j = 0; j < 3; ++j) {
+                const uint32_t x0 = g * 6 + j * 2;
+                if (x0 >= width) {
+                    cbs[j] = crs[j] = k.cOff;
+                    continue;
+                }
+                const uint32_t x1 = x0 + 1 < width ? x0 + 1 : x0;
+                const int ra = (row[x0 * 4 + 2] + row[x1 * 4 + 2] + 1) >> 1, ga = (row[x0 * 4 + 1] + row[x1 * 4 + 1] + 1) >> 1, ba = (row[x0 * 4] + row[x1 * 4] + 1) >> 1;
+                cbs[j] = cb(ra, ga, ba);
+                crs[j] = cr(ra, ga, ba);
+            }
+            d[g * 4 + 0] = static_cast<uint32_t>(cbs[0]) | (static_cast<uint32_t>(ys[0]) << 10) | (static_cast<uint32_t>(crs[0]) << 20);
+            d[g * 4 + 1] = static_cast<uint32_t>(ys[1]) | (static_cast<uint32_t>(cbs[1]) << 10) | (static_cast<uint32_t>(ys[2]) << 20);
+            d[g * 4 + 2] = static_cast<uint32_t>(crs[1]) | (static_cast<uint32_t>(ys[3]) << 10) | (static_cast<uint32_t>(cbs[2]) << 20);
+            d[g * 4 + 3] = static_cast<uint32_t>(ys[4]) | (static_cast<uint32_t>(crs[2]) << 10) | (static_cast<uint32_t>(ys[5]) << 20);
+        }
+    }
+}
+
 static void I420Into(const uint8_t* src, uint32_t width, uint32_t height, uint8_t* dst) {
     const uint32_t cw = width / 2, ch = height / 2;
     uint8_t* yp = dst;
@@ -134,6 +189,7 @@ size_t ConvertedSize(uint32_t width, uint32_t height, int format) {
     if (format == 1) return px * 2;
     if (format == 2) return px * 3;
     if (format == 4) return px + 2u * (static_cast<size_t>(width / 2) * (height / 2));
+    if (format >= 5 && format <= 8) return TargetBytes(TargetSpec{width, height, format});
     return px * 4;  // 0 = BGRA, 3 = RGBA
 }
 
@@ -165,6 +221,10 @@ bool ConvertBgraInto(const uint8_t* src, uint32_t width, uint32_t height, int fo
         I420Into(src, width, height, dst);
         return true;
     }
+    if (format >= 5 && format <= 8) {
+        CardInto(src, width, height, format, dst);
+        return true;
+    }
     return false;
 }
 
@@ -172,7 +232,7 @@ bool ConvertBgraInto(const uint8_t* src, uint32_t width, uint32_t height, int fo
 // every other format needs a differently sized destination, so it swaps in a new buffer.
 bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t height, int format) {
     if (format == 3) return ConvertBgraInto(buf.data(), width, height, 3, buf.data());
-    if (format != 1 && format != 2 && format != 4) return false;
+    if (format != 1 && format != 2 && format != 4 && !(format >= 5 && format <= 8)) return false;
     std::vector<uint8_t> out(ConvertedSize(width, height, format));
     ConvertBgraInto(buf.data(), width, height, format, out.data());
     buf.swap(out);
@@ -200,6 +260,17 @@ Napi::Value ConvertBgraToUyvy(const Napi::CallbackInfo& info) {
 
 Napi::Value ConvertBgraToUyva(const Napi::CallbackInfo& info) {
     return ConvertInto(info, 2);
+}
+
+// convertBgraToCard(bgra, width, height, format) with format 5-8 (osr_readback.h): an SDI card's own
+// format, for a frame the GPU did not already produce in it
+Napi::Value ConvertBgraToCard(const Napi::CallbackInfo& info) {
+    const int format = info.Length() > 3 && info[3].IsNumber() ? info[3].As<Napi::Number>().Int32Value() : 0;
+    if (format < 5 || format > 8) {
+        Napi::TypeError::New(info.Env(), "card format must be 5-8").ThrowAsJavaScriptException();
+        return info.Env().Undefined();
+    }
+    return ConvertInto(info, format);
 }
 
 // Native box-filter downscale of tightly-packed BGRA (srcW*srcH*4) to dstW*dstH*4. Averages each destination
@@ -356,6 +427,7 @@ Napi::Value PreviewFrame(const Napi::CallbackInfo& info) {
 void RegisterConvert(Napi::Env env, Napi::Object exports) {
     exports.Set("previewFrame", Napi::Function::New(env, PreviewFrame));
     exports.Set("convertBgraToI420", Napi::Function::New(env, ConvertBgraToI420));
+    exports.Set("convertBgraToCard", Napi::Function::New(env, ConvertBgraToCard));
     exports.Set("convertBgraToUyvy", Napi::Function::New(env, ConvertBgraToUyvy));
     exports.Set("convertBgraToUyva", Napi::Function::New(env, ConvertBgraToUyva));
     exports.Set("downscaleBgra", Napi::Function::New(env, DownscaleBgra));

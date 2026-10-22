@@ -13,8 +13,12 @@ namespace osrcap {
 
 // A per-consumer output produced from the same shared texture in the same GPU pass as the main readback:
 // the source box-downscaled to w x h and packed as `format` (0 BGRA, 1 UYVY, 2 UYVA, 4 I420 planar
-// Y/U/V, BT.601 limited range — what a video encoder wants). One render can feed outputs of several
-// resolutions with one readback (render once at the largest, downscale the rest).
+// Y/U/V, BT.601 limited range — what a video encoder wants; 5-8 the SDI card formats below). One render can
+// feed outputs of several resolutions with one readback (render once at the largest, downscale the rest).
+//
+// SDI card formats, limited range as SDI carries it, 4:2:2 with each chroma sample the average of its pixel
+// pair: 5 = 8-bit '2vuy' (U Y0 V Y1) BT.709, 6 = the same BT.601, 7 = 10-bit v210 BT.709, 8 = v210 BT.601.
+// v210 packs 6 pixels in four 32-bit words and pads each row to a multiple of 128 bytes (48 pixels).
 struct TargetSpec {
     uint32_t w = 0;
     uint32_t h = 0;
@@ -25,10 +29,29 @@ struct TargetDst {
     uint8_t* data = nullptr;
     size_t size = 0;
 };
+inline size_t V210RowBytes(uint32_t w) { return static_cast<size_t>((w + 47) / 48) * 128; }
 inline size_t TargetBytes(const TargetSpec& t) {
     size_t px = static_cast<size_t>(t.w) * t.h;
     if (t.format == 4) return px + 2 * (static_cast<size_t>(t.w / 2) * (t.h / 2));
+    if (t.format == 5 || t.format == 6) return px * 2;
+    if (t.format == 7 || t.format == 8) return V210RowBytes(t.w) * t.h;
     return t.format == 1 ? px * 2 : (t.format == 2 ? px * 3 : px * 4);
+}
+// The card formats' fixed-point coefficients (x1024, applied to 8-bit R,G,B), shared by the CPU converter
+// and written out in every GPU kernel: Y = ((ky . rgb + 512) >> 10) + yOff and C = (kc . rgb + cOff * 1024
+// + 512) >> 10, every sum non-negative so the shift is a plain floor everywhere.
+struct CardCoeffs {
+    int ky[3], kb[3], kr[3];
+    int yOff, cOff;
+};
+inline CardCoeffs CardCoefficients(int format) {
+    const bool bt601 = format == 6 || format == 8;
+    if (format == 7 || format == 8) {
+        return bt601 ? CardCoeffs{{1052, 2065, 401}, {-607, -1192, 1799}, {1799, -1506, -293}, 64, 512}
+                     : CardCoeffs{{748, 2516, 254}, {-412, -1387, 1799}, {1799, -1634, -165}, 64, 512};
+    }
+    return bt601 ? CardCoeffs{{263, 516, 100}, {-152, -298, 450}, {450, -377, -73}, 16, 128}
+                 : CardCoeffs{{187, 629, 63}, {-103, -347, 450}, {450, -409, -41}, 16, 128};
 }
 // Whether this platform's GPU backend produces TargetSpec outputs.
 bool TargetsSupported();
