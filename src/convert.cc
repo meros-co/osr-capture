@@ -262,13 +262,26 @@ Napi::Value ConvertBgraToUyva(const Napi::CallbackInfo& info) {
     return ConvertInto(info, 2);
 }
 
-// convertBgraToCard(bgra, width, height, format) with format 5-8 (osr_readback.h): an SDI card's own
-// format, for a frame the GPU did not already produce in it
+// convertBgraToCard(bgra, width, height, format, into?) with format 5-8 (osr_readback.h): an SDI card's own
+// format, for a frame the GPU did not already produce in it. `into`, when large enough, receives the frame and
+// is returned, so a caller converting every frame reuses its buffers instead of allocating one per frame.
 Napi::Value ConvertBgraToCard(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
     const int format = info.Length() > 3 && info[3].IsNumber() ? info[3].As<Napi::Number>().Int32Value() : 0;
     if (format < 5 || format > 8) {
-        Napi::TypeError::New(info.Env(), "card format must be 5-8").ThrowAsJavaScriptException();
-        return info.Env().Undefined();
+        Napi::TypeError::New(env, "card format must be 5-8").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() > 4 && info[4].IsBuffer()) {
+        Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
+        const uint32_t width = info[1].As<Napi::Number>().Uint32Value();
+        const uint32_t height = info[2].As<Napi::Number>().Uint32Value();
+        Napi::Buffer<uint8_t> into = info[4].As<Napi::Buffer<uint8_t>>();
+        const size_t need = ConvertedSize(width, height, format);
+        if (into.Length() >= need && src.Length() >= static_cast<size_t>(width) * height * 4) {
+            ConvertBgraInto(src.Data(), width, height, format, into.Data());
+            return info[4];
+        }
     }
     return ConvertInto(info, format);
 }
