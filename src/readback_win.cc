@@ -2251,7 +2251,8 @@ struct ReadbackContext {
 };
 
 constexpr size_t kMaxPool = 16;
-std::vector<std::unique_ptr<ReadbackContext>> g_pool;
+// never destroyed: releasing the D3D12 devices during process exit leaves the process stuck in teardown
+std::vector<std::unique_ptr<ReadbackContext>>& g_pool = *new std::vector<std::unique_ptr<ReadbackContext>>();
 std::mutex g_poolMutex;
 std::condition_variable g_poolCv;
 
